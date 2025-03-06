@@ -1,0 +1,3 @@
+[submodule "sub/pytorch-openpose"]
+	path = sub/pytorch-openpose
+	url = git@github.com:Hzzone/pytorch-openpose.git
