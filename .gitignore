@@ -169,3 +169,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# add ANY directory called 'log' to your .gitignore, even if its nested 
+**/log/
