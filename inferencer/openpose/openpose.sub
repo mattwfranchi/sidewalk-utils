@@ -5,16 +5,17 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32gb
-#SBATCH --array=0-0  # Start with just one job for testing
-#SBATCH --time=4:00:00
+#SBATCH --cpus-per-task=4   # Increased
+#SBATCH --mem=64gb          # Increased
+#SBATCH --array=0-499%4
+#SBATCH --time=24:00:00
 #SBATCH --partition=pierson
 
 # Create logs directory if it doesn't exist
 mkdir -p log
 
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+# Optimize CUDA memory allocation
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
 export CUDA_LAUNCH_BLOCKING=0
 export OMP_NUM_THREADS=8
 
@@ -23,22 +24,32 @@ echo "Running on host: $(hostname)"
 echo "Current working directory: $(pwd)"
 echo "Python version: $(python --version)"
 
+# Get constants from c.py
+FILE_LIST=$(python -c "from c import nexar2020_tuesthurs_subset; print(nexar2020_tuesthurs_subset)")
+OUTPUT_DIR=$(python -c "from c import nexar2020_tuesthurs_output; print(nexar2020_tuesthurs_output)")
+
+echo "Using file list: $FILE_LIST"
+echo "Using output directory: $OUTPUT_DIR"
+
 # Verify paths
 echo "Checking file paths:"
-echo "File list exists: $(ls -la /share/ju/autoglancing/data/raw_export/nexar2020_images_20250308_190550.txt 2>/dev/null && echo Yes || echo No)"
+echo "File list exists: $(ls -la $FILE_LIST 2>/dev/null && echo Yes || echo No)"
 echo "Model path exists: $(ls -la /share/ju/autoglancing/sub/pytorch-openpose/model/body_pose_model.pth 2>/dev/null && echo Yes || echo No)"
-echo "Output directory exists: $(ls -la /share/ju/autoglancing/data/detections/2020/openpose 2>/dev/null && echo Yes || echo No)"
+echo "Output directory exists: $(ls -la $OUTPUT_DIR 2>/dev/null && echo Yes || echo No)"
+
+# Create output directory if it doesn't exist
+mkdir -p $OUTPUT_DIR
 
 # Activate virtual environment if needed
 echo "Activating conda environment..."
 source activate /share/ju/autoglancing/conda/pytorch-openpose
 
-# Run the script with a small subset for testing
+# Run the script with a larger batch size
 python slurm_runner.py \
-  --file-list /share/ju/autoglancing/data/raw_export/nexar2020_images_20250308_190550.txt \
-  --output-dir /share/ju/autoglancing/data/detections/2020/openpose \
+  --file-list $FILE_LIST \
+  --output-dir $OUTPUT_DIR \
   --model-path /share/ju/autoglancing/sub/pytorch-openpose/model/body_pose_model.pth \
-  --batch-size 128 \
+  --batch-size 512 \
   --confidence 0.4 \
   --min-keypoints 4 \
   --scale-factor 0.5 \

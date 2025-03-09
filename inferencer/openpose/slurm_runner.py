@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 from openpose import OpenPoseInferencer
 import numpy as np
+import json
 
 def print_with_flush(message):
     """Print message and flush stdout to ensure it appears in logs immediately."""
@@ -179,6 +180,12 @@ def main():
         scale_factor=args.scale_factor
     )
     
+    # Initialize a master results dictionary to accumulate all batch results
+    all_results = {}
+    pedestrians_found = 0
+    total_pedestrians = 0
+    
+    # Process in batches
     for i in range(0, len(image_paths), batch_size):
         batch_paths = image_paths[i:i + batch_size]
         batch_scratch_paths = []
@@ -219,8 +226,46 @@ def main():
         scratch_file_count = sum(1 for p in batch_scratch_paths if p.startswith(scratch_dir))
         print_with_flush(f"Successfully copied {scratch_file_count}/{len(batch_paths)} files to scratch")
         
+        # Create a batch-specific output directory
+        batch_output_dir = os.path.join(task_output_dir, f"batch_{i//batch_size}")
+        os.makedirs(batch_output_dir, exist_ok=True)
+        
         # Process current batch of images from scratch
-        batch_results = inferencer.process_image_list(batch_scratch_paths, task_output_dir)
+        batch_results = inferencer.process_batch(batch_scratch_paths)
+        
+        # Save this batch's results separately (this avoids any possibility of overwriting)
+        print_with_flush(f"Saving batch {i//batch_size} results to {batch_output_dir}")
+        inferencer.save_detection_results(batch_results, batch_output_dir)
+        
+        # Also update our aggregated results
+        all_results.update(batch_results)
+        
+        # Update statistics
+        for result in batch_results.values():
+            if result['is_pedestrian']:
+                pedestrians_found += 1
+            total_pedestrians += result['num_pedestrians']
+        
+        # Save intermediate checkpoint after each batch
+        if (i + batch_size) % 1000 < batch_size or i + batch_size >= len(image_paths):
+            checkpoint_dir = os.path.join(task_output_dir, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
+            checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{i+batch_size}.json")
+            print_with_flush(f"Saving checkpoint at {i+batch_size}/{len(image_paths)} images")
+            
+            # Save only the paths and pedestrian status for checkpointing
+            checkpoint_data = {
+                "pedestrian_images": [p for p, r in all_results.items() if r["is_pedestrian"]],
+                "non_pedestrian_images": [p for p, r in all_results.items() if not r["is_pedestrian"]],
+                "processed_count": len(all_results),
+                "pedestrians_found": pedestrians_found,
+                "total_pedestrians": total_pedestrians,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            with open(checkpoint_file, 'w') as f:
+                json.dump(checkpoint_data, f)
         
         # Clean up scratch files for this batch to free space
         print_with_flush("Cleaning up scratch files from this batch")
@@ -230,6 +275,28 @@ def main():
                     os.remove(path)
                 except Exception as e:
                     print_with_flush(f"Warning: Could not remove scratch file {path}: {e}")
+    
+    # Save the final aggregated results
+    print_with_flush(f"Saving final results for {len(all_results)} images")
+    inferencer.save_detection_results(all_results, task_output_dir)
+    
+    # Save the combined summary in the parent directory
+    summary_path = os.path.join(task_output_dir, "summary.json")
+    summary = {
+        "total_images": len(all_results),
+        "images_with_pedestrians": len([r for r in all_results.values() if r["is_pedestrian"]]),
+        "images_without_pedestrians": len(all_results) - len([r for r in all_results.values() if r["is_pedestrian"]]),
+        "batches_processed": (len(image_paths) + batch_size - 1) // batch_size,
+        "detection_parameters": {
+            "confidence_threshold": args.confidence,
+            "min_keypoints": args.min_keypoints,
+            "scale_factor": args.scale_factor
+        },
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
     
     # Final cleanup of scratch directory
     try:

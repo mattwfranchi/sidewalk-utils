@@ -7,6 +7,7 @@ import time
 import logging
 import sys
 from pathlib import Path
+import json
 
 # Assuming the pytorch-openpose code is available in a submodule
 sys.path.append("../../sub/pytorch-openpose")
@@ -55,6 +56,7 @@ class OpenPoseInferencer:
         self.load_model()
 
         torch.backends.cudnn.benchmark = True
+        self.use_amp = False  # No mixed precision
         
     def setup_logging(self):
         """Configure logging for the inferencer"""
@@ -81,34 +83,52 @@ class OpenPoseInferencer:
         self.logger.info(f"Using device: {self.device} ({torch.cuda.get_device_name(self.device_id)})")
         
     def load_model(self):
-        """Load OpenPose model with mixed precision support"""
+        """Load OpenPose model with TorchScript optimization"""
         self.logger.info(f"Loading OpenPose model from {self.model_path}")
         self.model = Body(self.model_path)
+        self.use_amp = False  # Disable mixed precision as it's incompatible with OpenPose
         
-        # Enable mixed precision (FP16) for faster computation
-        if torch.cuda.is_available():
-            self.use_amp = True
-            # Set up for PyTorch's automatic mixed precision
-            self.scaler = torch.cuda.amp.GradScaler()
-            self.logger.info("Using mixed precision (FP16) for faster inference")
-        else:
-            self.use_amp = False
-            
+        # Try to optimize the model with TorchScript
+        try:
+            if torch.cuda.is_available():
+                self.logger.info("Optimizing model with TorchScript...")
+                success = self.model.optimize()
+                if (success):
+                    self.logger.info("TorchScript optimization successful")
+                else:
+                    self.logger.info("TorchScript optimization failed, using original model")
+        except Exception as e:
+            self.logger.warning(f"Error during TorchScript optimization: {e}")
+        
         self.logger.info("Model loaded successfully")
+        self.warmup()  # Call the warmup method
     
     def warmup(self):
-        """Pre-allocate GPU memory and warm up the model"""
+        """Warmup the model with a dummy batch to optimize performance."""
+        self.logger.info("Warming up model with a dummy batch...")
+        
+        # Create a dummy batch
+        batch_size = min(4, self.batch_size)  # Small batch for warmup
+        dummy_tensor = torch.zeros((batch_size, 3, 368, 368), dtype=torch.float32)
+        
         if torch.cuda.is_available():
-            # Force CUDA initialization
-            dummy = torch.zeros(1).cuda()
+            dummy_tensor = dummy_tensor.cuda()
             
-            # Create a dummy batch to warm up the model
-            dummy_img = np.zeros((368, 368, 3), dtype=np.uint8)
-            self.model(dummy_img)
-            
-            # Clear cache to start fresh
-            torch.cuda.empty_cache()
-            self.logger.info("Model warmed up and GPU memory pre-allocated")
+            # Try to optimize the model with TorchScript
+            if hasattr(self.model, 'optimize'):
+                success = self.model.optimize()
+                if success:
+                    self.logger.info("Model optimization successful")
+                else:
+                    self.logger.info("Model optimization failed, using original model")
+        
+        # Run a forward pass to warm up the model
+        with torch.no_grad():
+            try:
+                _ = self.model.process_batch(dummy_tensor)
+                self.logger.info("Warmup complete")
+            except Exception as e:
+                self.logger.warning(f"Warmup failed: {e}")
                 
     def preprocess_image(self, image_path: str) -> np.ndarray:
         """Optimized image preprocessing with GPU acceleration when possible"""
@@ -139,47 +159,70 @@ class OpenPoseInferencer:
             self.logger.warning(f"Error processing image {image_path}: {e}")
             return None
     
+    def preprocess_batch(self, image_paths: List[str]) -> Tuple[List[np.ndarray], List[str]]:
+        """Preprocess multiple images in parallel"""
+        from concurrent.futures import ThreadPoolExecutor
+        
+        images = []
+        valid_paths = []
+        
+        def load_and_preprocess(img_path):
+            try:
+                img = self.preprocess_image(img_path)
+                if img is not None:
+                    return img_path, img
+                return None
+            except Exception as e:
+                self.logger.warning(f"Error preprocessing {img_path}: {e}")
+                return None
+        
+        # Use thread pool for parallel I/O
+        with ThreadPoolExecutor(max_workers=min(16, len(image_paths))) as executor:
+            results = list(executor.map(load_and_preprocess, image_paths))
+        
+        # Filter out None results and separate paths and images
+        for result in results:
+            if result is not None:
+                path, img = result
+                valid_paths.append(path)
+                images.append(img)
+        
+        return images, valid_paths
+    
     def is_pedestrian(self, subset: np.ndarray, candidate: np.ndarray) -> bool:
-        """More robust pedestrian detection that handles partial occlusion better"""
         if subset.size == 0:
             return False
         
-        # OpenPose keypoint indices
-        HEAD_PARTS = [0, 14, 15, 16, 17]  # Nose, eyes, ears
-        TORSO_PARTS = [1, 2, 5, 8, 11]    # Neck, shoulders, hips
-        
-        # Check each person detection
-        for person_idx in range(len(subset)):
-            person_keypoints = subset[person_idx, :18]
+        # Vectorize operations for better performance
+        if subset.shape[0] > 0:
+            # Calculate key metrics for all detections at once
+            head_parts = np.array([0, 14, 15, 16, 17])
+            torso_parts = np.array([1, 2, 5, 8, 11])
             
-            head_detected = sum(1 for idx in HEAD_PARTS if person_keypoints[idx] >= 0)
-            torso_detected = sum(1 for idx in TORSO_PARTS if person_keypoints[idx] >= 0)
-            total_detected = int(subset[person_idx, -1])
+            # Count valid parts using vectorized operations
+            head_counts = np.sum(subset[:, head_parts] >= 0, axis=1)
+            torso_counts = np.sum(subset[:, torso_parts] >= 0, axis=1)
+            total_counts = subset[:, -1].astype(int)
             
-            confidence = subset[person_idx, -2] / subset[person_idx, -1] if subset[person_idx, -1] > 0 else 0
+            # Calculate confidences
+            confidences = subset[:, -2] / np.maximum(subset[:, -1], 1)
             
-            if (head_detected >= 1 and torso_detected >= 2 and confidence >= self.confidence_threshold):
+            # Check conditions with vectorized operations
+            condition1 = (head_counts >= 1) & (torso_counts >= 2) & (confidences >= self.confidence_threshold)
+            condition2 = (torso_counts >= 3) & (total_counts >= self.min_keypoints) & (confidences >= self.confidence_threshold)
+            condition3 = (total_counts >= self.min_keypoints + 2) & (confidences >= self.confidence_threshold + 0.1)
+            
+            # If any detection meets any condition, return True
+            if np.any(condition1 | condition2 | condition3):
                 return True
-            elif (torso_detected >= 3 and total_detected >= self.min_keypoints and 
-                  confidence >= self.confidence_threshold):
-                return True
-            elif (total_detected >= self.min_keypoints + 2 and confidence >= self.confidence_threshold + 0.1):
-                return True
-        
+                
         return False
     
     def process_batch(self, image_paths: List[str]) -> Dict[str, dict]:
         # Pre-load all images in parallel
-        images = []
-        valid_paths = []
+        images, valid_paths = self.preprocess_batch(image_paths)
         
         start_time = time.time()
-        
-        for img_path in image_paths:
-            img = self.preprocess_image(img_path)
-            if img is not None:
-                images.append(img)
-                valid_paths.append(img_path)
         
         load_time = time.time() - start_time
         self.logger.info(f"Loaded {len(valid_paths)} images in {load_time:.2f}s")
@@ -187,56 +230,169 @@ class OpenPoseInferencer:
         results = {}
         batch_start_time = time.time()
         
-        # Use CUDA events for more accurate GPU timing
-        if torch.cuda.is_available():
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            start_event.record()
+        # Process in true batches
+        if len(valid_paths) > 0:
+            try:
+                # Add debug logging
+                self.logger.info("Starting batch processing")
+                
+                # Batch processing using modified Body class
+                batch_candidates, batch_subsets = self.process_images_in_batch(images)
+                
+                self.logger.info(f"Batch processing complete. Got {len(batch_candidates)} candidates and {len(batch_subsets)} subsets")
+                
+                # Process the results for each image
+                for i in range(len(valid_paths)):
+                    if i < len(batch_candidates) and i < len(batch_subsets):
+                        img_path = valid_paths[i]
+                        candidate = batch_candidates[i]
+                        subset = batch_subsets[i]
+                        
+                        # Convert keypoints to original scale if needed
+                        if self.scale_factor != 1.0 and isinstance(candidate, np.ndarray) and candidate.size > 0:
+                            candidate[:, 0] /= self.scale_factor
+                            candidate[:, 1] /= self.scale_factor
+                        
+                        has_pedestrian = self.is_pedestrian(subset, candidate)
+                        num_pedestrians = 0 if subset.size == 0 else len(subset)
+                        
+                        results[img_path] = {
+                            "candidate": candidate,
+                            "subset": subset,
+                            "is_pedestrian": has_pedestrian,
+                            "num_pedestrians": num_pedestrians
+                        }
+                
+            except Exception as e:
+                self.logger.error(f"Error in batch processing: {e}")
+                # Fall back to one-by-one processing
+                for i, (img_path, img) in enumerate(zip(valid_paths, images)):
+                    try:
+                        candidate, subset = self.model(img)
+                        
+                        # Convert keypoints to original scale if needed
+                        if self.scale_factor != 1.0 and candidate.ndim == 2 and candidate.size > 0:
+                            candidate[:, 0] /= self.scale_factor
+                            candidate[:, 1] /= self.scale_factor
+                        
+                        has_pedestrian = self.is_pedestrian(subset, candidate)
+                        num_pedestrians = 0 if subset.size == 0 else len(subset)
+                        
+                        results[img_path] = {
+                            "candidate": candidate,
+                            "subset": subset,
+                            "is_pedestrian": has_pedestrian,
+                            "num_pedestrians": num_pedestrians
+                        }
+                    except Exception as e:
+                        self.logger.error(f"Error processing image {img_path}: {e}")
+                        results[img_path] = {
+                            "candidate": np.array([]),
+                            "subset": np.array([]),
+                            "is_pedestrian": False,
+                            "num_pedestrians": 0
+                        }
         
-        # Process all images one by one
-        for i, (img_path, img) in enumerate(zip(valid_paths, images)):
-            candidate, subset = self.model(img)
-            
-            # Convert keypoints to original scale if needed
-            if self.scale_factor != 1.0 and candidate.ndim == 2 and candidate.size > 0:
-                candidate[:, 0] /= self.scale_factor
-                candidate[:, 1] /= self.scale_factor
-            
-            has_pedestrian = self.is_pedestrian(subset, candidate)
-            num_pedestrians = 0 if subset.size == 0 else len(subset)
-            
-            results[img_path] = {
-                "candidate": candidate,
-                "subset": subset,
-                "is_pedestrian": has_pedestrian,
-                "num_pedestrians": num_pedestrians
-            }
-        
-        if torch.cuda.is_available():
-            end_event.record()
-            torch.cuda.synchronize()
-            gpu_time = start_event.elapsed_time(end_event) / 1000.0
-            self.logger.info(f"GPU processing time: {gpu_time:.2f}s")
-        
-        # Final FPS calculation for the whole batch
         total_time = time.time() - batch_start_time
         avg_fps = len(valid_paths) / total_time if total_time > 0 else 0
         
         self.logger.info(f"Batch complete: {len(valid_paths)} images processed in {total_time:.2f}s - FPS: {avg_fps:.2f}")
         
         return results
+
+    def process_images_in_batch(self, images):
+        """Process multiple images in a single batch with true batching."""
+        if not images:
+            return [], []
+            
+        # Create batch tensor
+        batch_size = len(images)
+        
+        # Preprocess all images to have the same dimensions
+        processed_images = []
+        original_shapes = []
+        
+        for img in images:
+            original_shapes.append((img.shape[0], img.shape[1]))
+            # Use a fixed size for all images to ensure efficient batch processing
+            target_size = (368, 368)  # Standard OpenPose size
+            resized_img = cv2.resize(img, target_size, interpolation=cv2.INTER_LINEAR)
+            processed_images.append(resized_img)
+        
+        # Create batch tensor
+        batch_tensor = torch.zeros((batch_size, 3, 368, 368), dtype=torch.float32)
+        
+        for i, img in enumerate(processed_images):
+            # Convert to tensor and normalize
+            img_tensor = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+            batch_tensor[i] = img_tensor
+        
+        if torch.cuda.is_available():
+            batch_tensor = batch_tensor.cuda()
+        
+        # Add this before inference
+        if torch.cuda.is_available() and hasattr(self, 'use_amp') and self.use_amp:
+            batch_tensor = batch_tensor
+        
+        # Use autocast for mixed precision
+        with torch.cuda.amp.autocast(enabled=getattr(self, 'use_amp', False)):
+            try:
+                candidates, subsets = self.model.process_batch(batch_tensor)
+                
+                # Make sure we get valid lists even if something goes wrong
+                if candidates is None or subsets is None:
+                    candidates = [np.array([]) for _ in range(batch_size)]
+                    subsets = [np.array([]) for _ in range(batch_size)]
+                
+                # Ensure we have the right number of results
+                if len(candidates) != batch_size or len(subsets) != batch_size:
+                    self.logger.warning(f"Expected {batch_size} results, got {len(candidates)} candidates and {len(subsets)} subsets")
+                    # Pad results if needed
+                    candidates = candidates + [np.array([])] * (batch_size - len(candidates))
+                    subsets = subsets + [np.array([])] * (batch_size - len(subsets))
+                    
+            except Exception as e:
+                self.logger.error(f"Error in batch processing: {e}")
+                candidates = [np.array([]) for _ in range(batch_size)]
+                subsets = [np.array([]) for _ in range(batch_size)]
+        
+        # FIX: Properly scale the candidates without unpacking error
+        scaled_candidates = []
+        for i in range(len(candidates)):
+            candidate = candidates[i]
+            if i < len(original_shapes):  # Ensure we don't go out of bounds
+                orig_h, orig_w = original_shapes[i]  # Unpack correctly
+                if isinstance(candidate, np.ndarray) and candidate.size > 0:
+                    # Scale in single operation with float32 precision
+                    if candidate.shape[1] >= 3:  # Ensure we have enough dimensions
+                        scale_factors = np.array([orig_w / 368.0, orig_h / 368.0, 1.0])
+                        candidate[:, :3] *= scale_factors
+                scaled_candidates.append(candidate)
+            else:
+                scaled_candidates.append(np.array([]))
+        
+        return scaled_candidates, subsets
     
     def process_image_list(self, image_paths: List[str], output_dir: str = None):
-        """Process a list of images in batches and optionally save results"""
+        """Process with periodic saving to avoid data loss"""
         num_images = len(image_paths)
         self.logger.info(f"Starting inference on {num_images} images")
+        
+        # Optimize memory usage
+        self.optimize_memory_usage()
         
         results = {}
         pedestrians_found = 0
         total_pedestrians = 0
         
-        # Process in batches
+        # Create checkpoint directory
+        if output_dir:
+            checkpoint_dir = os.path.join(output_dir, "checkpoints")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Process in batches with periodic saving
+        save_frequency = min(1000, max(self.batch_size * 10, 100))  # Every ~1000 images
+        
         for i in range(0, num_images, self.batch_size):
             batch_paths = image_paths[i:i + self.batch_size]
             batch_results = self.process_batch(batch_paths)
@@ -248,16 +404,30 @@ class OpenPoseInferencer:
                 if result['is_pedestrian']:
                     pedestrians_found += 1
                 total_pedestrians += result['num_pedestrians']
+            
+            # Save intermediate results periodically
+            if output_dir and (i + self.batch_size) % save_frequency < self.batch_size:
+                checkpoint_file = os.path.join(checkpoint_dir, f"checkpoint_{i+self.batch_size}.json")
+                self.logger.info(f"Saving checkpoint at {i+self.batch_size}/{num_images} images")
+                
+                # Save only the paths and pedestrian status for checkpointing
+                checkpoint_data = {
+                    "pedestrian_images": [p for p, r in results.items() if r["is_pedestrian"]],
+                    "non_pedestrian_images": [p for p, r in results.items() if not r["is_pedestrian"]],
+                    "processed_count": len(results),
+                    "pedestrians_found": pedestrians_found,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                with open(checkpoint_file, 'w') as f:
+                    json.dump(checkpoint_data, f)
                 
             self.logger.info(f"Progress: {min(i + self.batch_size, num_images)}/{num_images} images processed")
         
-        self.logger.info(f"Inference completed. Found pedestrians in {pedestrians_found}/{num_images} images")
-        self.logger.info(f"Total pedestrians detected: {total_pedestrians}")
-        
-        # Save results if output directory is provided
+        # Final save of complete results
         if output_dir:
             self.save_detection_results(results, output_dir)
-            
+        
         return results
     
     def save_detection_results(self, results: Dict[str, dict], output_dir: str):
@@ -273,22 +443,42 @@ class OpenPoseInferencer:
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
         
-        # Group images by pedestrian detection status
-        pedestrian_images = []
-        non_pedestrian_images = []
+        # Check for existing results
+        pedestrian_path = os.path.join(output_dir, "pedestrian_images.txt")
+        non_pedestrian_path = os.path.join(output_dir, "non_pedestrian_images.txt")
         
+        existing_pedestrians = set()
+        existing_non_pedestrians = set()
+        
+        # Load existing results if they exist
+        if os.path.exists(pedestrian_path):
+            with open(pedestrian_path, 'r') as f:
+                existing_pedestrians = set(line.strip() for line in f if line.strip())
+            self.logger.info(f"Found {len(existing_pedestrians)} existing pedestrian entries")
+                
+        if os.path.exists(non_pedestrian_path):
+            with open(non_pedestrian_path, 'r') as f:
+                existing_non_pedestrians = set(line.strip() for line in f if line.strip())
+            self.logger.info(f"Found {len(existing_non_pedestrians)} existing non-pedestrian entries")
+        
+        # Group images by pedestrian detection status
+        pedestrian_images = list(existing_pedestrians)
+        non_pedestrian_images = list(existing_non_pedestrians)
+        
+        # Add new results
         for img_path, result in results.items():
+            basename = os.path.basename(img_path)
             if result['is_pedestrian']:
-                pedestrian_images.append(os.path.basename(img_path))
+                if basename not in existing_pedestrians:
+                    pedestrian_images.append(basename)
             else:
-                non_pedestrian_images.append(os.path.basename(img_path))
+                if basename not in existing_non_pedestrians:
+                    non_pedestrian_images.append(basename)
         
         # Save lists of image names
-        pedestrian_path = os.path.join(output_dir, "pedestrian_images.txt")
         with open(pedestrian_path, 'w') as f:
             f.write('\n'.join(pedestrian_images))
         
-        non_pedestrian_path = os.path.join(output_dir, "non_pedestrian_images.txt")
         with open(non_pedestrian_path, 'w') as f:
             f.write('\n'.join(non_pedestrian_images))
         
@@ -323,12 +513,29 @@ class OpenPoseInferencer:
                 
                 saved_count += 1
         
-        # Also save a summary file
+        # Also save a summary file with aggregate statistics
         summary_path = os.path.join(output_dir, "summary.json")
+        
+        # Try loading existing summary if it exists
+        total_images = len(results)
+        images_with_pedestrians = len([r for r in results.values() if r["is_pedestrian"]])
+        images_without_pedestrians = total_images - images_with_pedestrians
+        
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, 'r') as f:
+                    existing_summary = json.load(f)
+                    # Add previous counts to current ones
+                    total_images += existing_summary.get("total_images", 0)
+                    images_with_pedestrians += existing_summary.get("images_with_pedestrians", 0)
+                    images_without_pedestrians += existing_summary.get("images_without_pedestrians", 0)
+            except Exception as e:
+                self.logger.warning(f"Error loading existing summary: {e}")
+        
         summary = {
-            "total_images": len(results),
-            "images_with_pedestrians": len(pedestrian_images),
-            "images_without_pedestrians": len(non_pedestrian_images),
+            "total_images": total_images,
+            "images_with_pedestrians": images_with_pedestrians,
+            "images_without_pedestrians": images_without_pedestrians,
             "detection_parameters": {
                 "confidence_threshold": self.confidence_threshold,
                 "min_keypoints": self.min_keypoints,
@@ -342,3 +549,23 @@ class OpenPoseInferencer:
         
         self.logger.info(f"Saved results: {len(pedestrian_images)} images with pedestrians, {len(non_pedestrian_images)} without")
         self.logger.info(f"Saved detailed keypoints for {saved_count} images with pedestrians")
+    
+    def optimize_memory_usage(self):
+        """Configure for optimal memory usage"""
+        if torch.cuda.is_available():
+            # Enable memory caching for faster allocation
+            torch.cuda.empty_cache()
+            
+            # Optimize memory allocation strategy
+            torch.cuda.set_per_process_memory_fraction(0.97)  # Use more of available memory
+            
+            # Enable TF32 on Ampere GPUs (A6000 should support this)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            # Set benchmark mode for faster convolutions
+            torch.backends.cudnn.benchmark = True
+            
+            # Disable gradient calculation (we're only doing inference)
+            torch.set_grad_enabled(False)
+
