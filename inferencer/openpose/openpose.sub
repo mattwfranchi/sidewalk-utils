@@ -1,0 +1,48 @@
+#!/bin/bash
+#SBATCH --job-name=openpose
+#SBATCH --output=log/openpose_%j.out
+#SBATCH --error=log/openpose_%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32gb
+#SBATCH --array=0-0  # Start with just one job for testing
+#SBATCH --time=4:00:00
+#SBATCH --partition=pierson
+
+# Create logs directory if it doesn't exist
+mkdir -p log
+
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export CUDA_LAUNCH_BLOCKING=0
+export OMP_NUM_THREADS=8
+
+echo "Job started at $(date)"
+echo "Running on host: $(hostname)"
+echo "Current working directory: $(pwd)"
+echo "Python version: $(python --version)"
+
+# Verify paths
+echo "Checking file paths:"
+echo "File list exists: $(ls -la /share/ju/autoglancing/data/raw_export/nexar2020_images_20250308_190550.txt 2>/dev/null && echo Yes || echo No)"
+echo "Model path exists: $(ls -la /share/ju/autoglancing/sub/pytorch-openpose/model/body_pose_model.pth 2>/dev/null && echo Yes || echo No)"
+echo "Output directory exists: $(ls -la /share/ju/autoglancing/data/detections/2020/openpose 2>/dev/null && echo Yes || echo No)"
+
+# Activate virtual environment if needed
+echo "Activating conda environment..."
+source activate /share/ju/autoglancing/conda/pytorch-openpose
+
+# Run the script with a small subset for testing
+python slurm_runner.py \
+  --file-list /share/ju/autoglancing/data/raw_export/nexar2020_images_20250308_190550.txt \
+  --output-dir /share/ju/autoglancing/data/detections/2020/openpose \
+  --model-path /share/ju/autoglancing/sub/pytorch-openpose/model/body_pose_model.pth \
+  --batch-size 128 \
+  --confidence 0.4 \
+  --min-keypoints 4 \
+  --scale-factor 0.5 \
+  --array-id $SLURM_ARRAY_TASK_ID \
+  --num-tasks $SLURM_ARRAY_TASK_COUNT
+
+echo "Job ended at $(date)"
