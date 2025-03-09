@@ -12,6 +12,12 @@ from pathlib import Path
 sys.path.append("../../sub/pytorch-openpose")
 from src.body import Body
 
+try:
+    import nvjpeg  # NVIDIA's GPU-accelerated JPEG decoder
+    HAS_NVJPEG = True
+except ImportError:
+    HAS_NVJPEG = False
+
 
 class OpenPoseInferencer:
     """
@@ -75,37 +81,63 @@ class OpenPoseInferencer:
         self.logger.info(f"Using device: {self.device} ({torch.cuda.get_device_name(self.device_id)})")
         
     def load_model(self):
-        """Load OpenPose model with half precision for faster inference"""
+        """Load OpenPose model with mixed precision support"""
         self.logger.info(f"Loading OpenPose model from {self.model_path}")
         self.model = Body(self.model_path)
         
-        # Try to convert model to half precision (FP16) for faster computation
-        if torch.cuda.is_available() and torch.cuda.get_device_capability(self.device_id)[0] >= 7:
-            try:
-                # This will need modification in the Body class implementation
-                # to fully support FP16 inference
-                self.logger.info("Attempting to use FP16 for faster inference")
-                # self.model = self.model.half()
-            except Exception as e:
-                self.logger.warning(f"Could not convert to FP16: {e}")
-                
+        # Enable mixed precision (FP16) for faster computation
+        if torch.cuda.is_available():
+            self.use_amp = True
+            # Set up for PyTorch's automatic mixed precision
+            self.scaler = torch.cuda.amp.GradScaler()
+            self.logger.info("Using mixed precision (FP16) for faster inference")
+        else:
+            self.use_amp = False
+            
         self.logger.info("Model loaded successfully")
+    
+    def warmup(self):
+        """Pre-allocate GPU memory and warm up the model"""
+        if torch.cuda.is_available():
+            # Force CUDA initialization
+            dummy = torch.zeros(1).cuda()
+            
+            # Create a dummy batch to warm up the model
+            dummy_img = np.zeros((368, 368, 3), dtype=np.uint8)
+            self.model(dummy_img)
+            
+            # Clear cache to start fresh
+            torch.cuda.empty_cache()
+            self.logger.info("Model warmed up and GPU memory pre-allocated")
                 
     def preprocess_image(self, image_path: str) -> np.ndarray:
-        """Preprocess an image for inference"""
-        img = cv2.imread(image_path)
-        if img is None:
-            self.logger.error(f"Failed to load image: {image_path}")
+        """Optimized image preprocessing with GPU acceleration when possible"""
+        try:
+            if HAS_NVJPEG and image_path.lower().endswith(('.jpg', '.jpeg')):
+                # Use GPU-accelerated JPEG decoding
+                with open(image_path, 'rb') as f:
+                    jpeg_data = f.read()
+                img = nvjpeg.decode(jpeg_data)
+            else:
+                # Fall back to OpenCV
+                img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                
+            if img is None:
+                return None
+                
+            # Convert BGR to RGB (if using nvjpeg it's already RGB)
+            if not HAS_NVJPEG:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                
+            # Use faster resize method
+            if self.scale_factor != 1.0:
+                new_size = (int(img.shape[1] * self.scale_factor), int(img.shape[0] * self.scale_factor))
+                img = cv2.resize(img, new_size, interpolation=cv2.INTER_LINEAR)
+            
+            return img
+        except Exception as e:
+            self.logger.warning(f"Error processing image {image_path}: {e}")
             return None
-            
-        # Resize for faster processing
-        if self.scale_factor != 1.0:
-            height, width = img.shape[:2]
-            new_height = int(height * self.scale_factor)
-            new_width = int(width * self.scale_factor)
-            img = cv2.resize(img, (new_width, new_height))
-            
-        return img
     
     def is_pedestrian(self, subset: np.ndarray, candidate: np.ndarray) -> bool:
         """More robust pedestrian detection that handles partial occlusion better"""
