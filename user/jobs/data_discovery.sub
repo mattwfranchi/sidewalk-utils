@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --job-name=data_discovery
+#SBATCH --output=../logs/data_discovery/%j.out
+#SBATCH --error=../logs/data_discovery/%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=128gb
+#SBATCH --time=4:00:00
+#SBATCH --partition=pierson
+
+source /home/mwf62/.bashrc
+source activate /share/ju/autoglancing/conda/autoglancing 
+
+python ../io.py --dataset_year=2020 --dates '["10-6-2020", "10-8-2020", "10-13-2020", "10-15-2020", "10-20-2020", "10-22-2020", "10-27-2020", "10-29-2020", "11-3-2020", "11-5-2020", "11-10-2020", "11-12-2020"]' --ncpus=12 --imgs=True --md=True --export_geoparquet=True

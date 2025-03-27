@@ -98,6 +98,19 @@ class BaseNexarDataset(ABC):
         """
         return filter_dataset_by_date(self, start_date, end_date, export)
     
+    def filter_by_specific_dates(self, dates, export=False, format="parquet"):
+        """Filter the dataset to include only records from specific dates.
+        
+        Args:
+            dates: List of dates as strings (YYYY-MM-DD) or datetime objects
+            export: Whether to export the filtered data
+            format: Export format for metadata ('parquet' or 'csv')
+            
+        Returns:
+            Tuple of (filtered_images, filtered_metadata)
+        """
+        return filter_dataset_by_specific_dates(self, dates, export, format)
+    
     def export_statistics(self, output_file=None):
         """Export statistics about the dataset.
         
@@ -248,6 +261,119 @@ class BaseNexarDataset(ABC):
             gc.collect()  # Force garbage collection
         
         return export_path
+    
+    def _export_geospatial_metadata(self, subset=None, prefix="", format="geoparquet", 
+                                    free_memory=False, crs="EPSG:4326"):
+        """Export metadata with GPS coordinates as a GeoParquet file.
+        
+        Args:
+            subset: Specific subset of metadata to export, or None for all
+            prefix: Prefix for the exported filename
+            format: Export format ('geoparquet' or 'geojson')
+            free_memory: Whether to delete the metadata from memory after export
+            crs: Coordinate reference system (default: EPSG:4326/WGS84)
+            
+        Returns:
+            Path to the exported file
+        """
+        try:
+            # Create export directory if it doesn't exist
+            export_dir = Path(EXPORT_DIR)
+            export_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Use provided subset or all metadata
+            md_to_export = subset if subset is not None else self.md
+            
+            # Check if the required columns are available
+            if 'gps_info.latitude' not in md_to_export.columns or 'gps_info.longitude' not in md_to_export.columns:
+                self.logger.error("Cannot export geospatial metadata: missing latitude/longitude columns")
+                return None
+                
+            # Generate filename with timestamp for uniqueness
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dataset_name = self.__class__.__name__.lower().replace("dataset", "")
+            
+            # Convert to GeoDataFrame with Point geometries
+            self.logger.info("Converting metadata to GeoDataFrame with Point geometries")
+            
+            # Import geopandas here to avoid dependency issues
+            try:
+                import geopandas as gpd
+                from shapely.geometry import Point
+            except ImportError:
+                self.logger.error("Cannot export GeoParquet: geopandas or shapely not installed")
+                return None
+            
+            # Create Point geometries from lat/lon
+            if PANDARALLEL_AVAILABLE and len(md_to_export) > 10000:
+                self.logger.info("Using parallel processing to create geometries")
+                md_to_export['geometry'] = md_to_export.parallel_apply(
+                    lambda row: Point(row['gps_info.longitude'], row['gps_info.latitude']) 
+                    if not pd.isna(row['gps_info.longitude']) and not pd.isna(row['gps_info.latitude']) 
+                    else None, axis=1
+                )
+            else:
+                md_to_export['geometry'] = md_to_export.apply(
+                    lambda row: Point(row['gps_info.longitude'], row['gps_info.latitude']) 
+                    if not pd.isna(row['gps_info.longitude']) and not pd.isna(row['gps_info.latitude']) 
+                    else None, axis=1
+                )
+            
+            # Drop rows with no geometry
+            geospatial_df = md_to_export.dropna(subset=['geometry'])
+            self.logger.info(f"Created {len(geospatial_df)} point geometries from GPS coordinates")
+            
+            # Convert to GeoDataFrame
+            gdf = gpd.GeoDataFrame(geospatial_df, geometry='geometry', crs=crs)
+            
+            if format.lower() == "geojson":
+                filename = f"{prefix}_{dataset_name}_geo_{timestamp}.geojson" if prefix else f"{dataset_name}_geo_{timestamp}.geojson"
+                export_path = export_dir / filename
+                gdf.to_file(export_path, driver="GeoJSON")
+                self.logger.success(f"Exported {len(gdf)} geospatial records to GeoJSON file {export_path}")
+            else:
+                # Default to GeoParquet
+                filename = f"{prefix}_{dataset_name}_geo_{timestamp}.parquet" if prefix else f"{dataset_name}_geo_{timestamp}.parquet"
+                export_path = export_dir / filename
+                
+                # Save as GeoParquet with GeoArrow encoding (same approach as geo_processor_base.py)
+                try:
+                    gdf.to_parquet(
+                        export_path,
+                        compression='snappy',
+                        geometry_encoding='geoarrow',
+                        write_covering_bbox=True,
+                        schema_version='1.1.0'
+                    )
+                    self.logger.success(f"Exported {len(gdf)} geospatial records to GeoParquet file {export_path}")
+                except ImportError:
+                    self.logger.error("Failed to save as GeoParquet: pyarrow package is required")
+                    return None
+                except Exception as e:
+                    self.logger.warning(f"Failed to use GeoArrow encoding: {e}, falling back to WKB")
+                    try:
+                        gdf.to_parquet(
+                            export_path,
+                            compression='snappy',
+                            geometry_encoding='WKB',
+                            write_covering_bbox=True
+                        )
+                        self.logger.success(f"Exported {len(gdf)} geospatial records to GeoParquet file using WKB encoding (fallback)")
+                    except Exception as e2:
+                        self.logger.error(f"Failed to save with fallback method: {e2}")
+                        return None
+                        
+            # Free memory if requested
+            if free_memory and subset is None:
+                self.logger.info("Freeing metadata from memory")
+                self.md = pd.DataFrame()
+                import gc
+                gc.collect()
+                
+            return export_path
+        except Exception as e:
+            self.logger.error(f"Error exporting geospatial metadata: {e}")
+            return None
     
     def align_images_with_metadata(self):
         """Align images with metadata to ensure perfect 1:1 matching."""
@@ -731,6 +857,131 @@ def filter_dataset_by_date(dataset, start_date=None, end_date=None, export=False
     
     return filtered_imgs, filtered_md
 
+def filter_dataset_by_specific_dates(dataset, dates, export=False, format="parquet"):
+    """Filter a dataset to include only records from specific dates.
+    
+    Args:
+        dataset: The dataset to filter
+        dates: List of dates as strings (YYYY-MM-DD) or datetime objects
+        export: Whether to export the filtered data
+        format: Export format for metadata ('parquet' or 'csv')
+        
+    Returns:
+        Tuple of (filtered_images, filtered_metadata)
+    """
+    logger = get_logger("filter_dataset_dates")
+    
+    # Log initial memory state
+    log_memory_usage(logger, "Before filtering")
+    
+    # Check if metadata is available
+    if dataset.md.empty:
+        logger.warning("No metadata available for filtering. Load metadata first.")
+        return dataset.imgs, dataset.md
+    
+    # If no dates specified, return the original dataset
+    if not dates or len(dates) == 0:
+        logger.info("No dates specified, returning original dataset")
+        return dataset.imgs, dataset.md
+    
+    # Convert string dates to datetime objects
+    parsed_dates = []
+    for date_str in dates:
+        try:
+            # Handle both date objects and strings
+            if isinstance(date_str, (datetime, pd.Timestamp)):
+                parsed_dates.append(pd.Timestamp(date_str).date())
+            else:
+                # Try different formats
+                try:
+                    # Try standard ISO format first
+                    parsed_dates.append(pd.to_datetime(date_str).date())
+                except:
+                    # Try other common formats if ISO fails
+                    formats = ['%Y-%m-%d', '%m-%d-%Y', '%m/%d/%Y', '%d-%m-%Y']
+                    for fmt in formats:
+                        try:
+                            parsed_dates.append(pd.to_datetime(date_str, format=fmt).date())
+                            break
+                        except:
+                            continue
+                    else:
+                        logger.warning(f"Couldn't parse date: {date_str}, skipping")
+        except Exception as e:
+            logger.warning(f"Error parsing date {date_str}: {e}")
+    
+    if not parsed_dates:
+        logger.warning("No valid dates found in the provided list")
+        return dataset.imgs, dataset.md
+    
+    logger.info(f"Filtering dataset for {len(parsed_dates)} specific dates: {', '.join(str(d) for d in parsed_dates)}")
+    
+    # Ensure timestamp column is properly converted to datetime
+    if 'timestamp' in dataset.md.columns:
+        # Check if timestamp is already in datetime format
+        if not pd.api.types.is_datetime64_any_dtype(dataset.md['timestamp']):
+            logger.info("Converting timestamp column to datetime format")
+            
+            # Use parallel processing if available
+            if PANDARALLEL_AVAILABLE:
+                logger.info("Using parallel processing for timestamp conversion")
+                # Convert from epoch milliseconds to datetime with timezone
+                dataset.md['timestamp'] = pd.to_datetime(dataset.md['timestamp'], unit='ms')
+                dataset.md['timestamp'] = dataset.md['timestamp'].parallel_apply(
+                    lambda x: x.tz_localize('UTC').tz_convert('US/Eastern')
+                )
+            else:
+                # Standard processing
+                dataset.md['timestamp'] = pd.to_datetime(dataset.md['timestamp'], unit='ms')
+                dataset.md['timestamp'] = dataset.md['timestamp'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
+                
+            logger.info(f"Timestamp sample: {dataset.md['timestamp'].iloc[0]} (converted from epoch time)")
+    else:
+        logger.error("No timestamp column found in metadata. Cannot filter by date.")
+        return dataset.imgs, dataset.md
+    
+    # Filter metadata to include only records from the specified dates
+    # This converts timestamp to date and checks if it's in our list of parsed dates
+    filtered_md = dataset.md[dataset.md['timestamp'].dt.date.isin(parsed_dates)]
+    
+    log_memory_usage(logger, "After metadata filtering")
+    
+    # Filter images by frame_id using parallel operations if available
+    filtered_imgs = []
+    if dataset.imgs:
+        filtered_frame_ids = set(filtered_md['frame_id'])
+        
+        # Use parallel processing for large image lists
+        if len(dataset.imgs) > 10000 and PANDARALLEL_AVAILABLE:
+            logger.info(f"Using parallel processing to filter {len(dataset.imgs)} images")
+            # Create a DataFrame for parallel filtering
+            img_df = pd.DataFrame({'path': dataset.imgs})
+            img_df['frame_id'] = img_df['path'].parallel_apply(lambda x: Path(x).stem)
+            img_df['keep'] = img_df['frame_id'].parallel_apply(lambda x: x in filtered_frame_ids)
+            filtered_imgs = [Path(p) for p in img_df[img_df['keep']]['path']]
+        else:
+            # Standard filtering for smaller lists
+            filtered_imgs = [img for img in dataset.imgs if Path(img).stem in filtered_frame_ids]
+    
+    log_memory_usage(logger, "After image filtering")
+    
+    logger.success(f"Filtered dataset contains {len(filtered_imgs)} images and {len(filtered_md)} metadata rows")
+    
+    # Export if requested
+    if export:
+        date_str = "specific_dates"
+        if len(parsed_dates) <= 3:
+            # Use abbreviated format for small number of dates
+            date_str = "_".join([d.strftime('%Y%m%d') for d in parsed_dates])
+        
+        if filtered_imgs:
+            dataset._export_image_paths(subset=filtered_imgs, prefix=f"filtered_{date_str}")
+        
+        if not filtered_md.empty:
+            dataset._export_metadata(subset=filtered_md, prefix=f"filtered_{date_str}", format=format)
+    
+    return filtered_imgs, filtered_md
+
 def export_dataset_statistics(dataset, output_file=None):
     """Generate and export statistics about a dataset.
     
@@ -1049,11 +1300,32 @@ def log_memory_usage(logger, operation_name=""):
 
 # Now let's modify the load_nexar_dataset function to use these new functions
 def load_nexar_dataset(dataset_year="2020", imgs=True, md=True, ncpus=8, 
-                      start_date=None, end_date=None, export=True, 
-                      format="parquet", no_stats=False, validate_align=True,
-                      split_chunks=None, free_memory_after_export=True,
-                      memory_tracking=True):
-    """Load a Nexar dataset, optionally filter by date, and show statistics."""
+                      start_date=None, end_date=None, dates=None, export=True, 
+                      format="parquet", export_geoparquet=True, no_stats=False, 
+                      validate_align=True, split_chunks=None, 
+                      free_memory_after_export=True, memory_tracking=True):
+    """Load a Nexar dataset, optionally filter by date, and show statistics.
+    
+    Args:
+        dataset_year: Year of the dataset ('2020' or '2023')
+        imgs: Whether to load images
+        md: Whether to load metadata
+        ncpus: Number of CPUs to use for parallel processing
+        start_date: Start date for range filtering (YYYY-MM-DD)
+        end_date: End date for range filtering (YYYY-MM-DD)
+        dates: List of specific dates to filter for (overrides start_date/end_date if provided)
+        export: Whether to export the dataset
+        format: Export format for metadata ('parquet' or 'csv')
+        export_geoparquet: Whether to export geospatial metadata as GeoParquet
+        no_stats: If True, don't show dataset statistics
+        validate_align: Whether to validate image-metadata alignment
+        split_chunks: Number of chunks to split the dataset into (None for no splitting)
+        free_memory_after_export: Whether to free memory after exporting
+        memory_tracking: Whether to track memory usage
+    
+    Returns:
+        Loaded dataset or result of splitting
+    """
     # If ncpus is not specified, use the number of available cores
     if ncpus is None:
         import multiprocessing
@@ -1088,26 +1360,31 @@ def load_nexar_dataset(dataset_year="2020", imgs=True, md=True, ncpus=8,
         if memory_tracking and PSUTIL_AVAILABLE:
             log_memory_usage(logger, "After loading metadata")
     
-    # Alignment happens automatically in the load_images/load_metadata methods
-    # when both images and metadata are loaded
-    
     # Validate alignment if requested and both images and metadata are loaded
     if validate_align and imgs and md and dataset.imgs and not dataset.md.empty:
         logger.info("Validating image-metadata alignment...")
         validate_image_metadata_alignment(dataset, fix_misalignment=True)
     
     # Apply date filtering if specified
-    if (start_date or end_date) and md and not dataset.md.empty:
-        logger.info(f"Filtering dataset by date range: {start_date} to {end_date}")
-        filtered_imgs, filtered_md = filter_dataset_by_date(
-            dataset, start_date, end_date, export=False, format=format
-        )
-        
-        # Update dataset with filtered data
-        dataset.imgs = filtered_imgs
-        dataset.md = filtered_md
-        
-        logger.success(f"Dataset filtered to {len(filtered_imgs)} images and {len(filtered_md)} metadata rows")
+    if md and not dataset.md.empty:
+        if dates:  # Specific dates filtering takes precedence
+            logger.info(f"Filtering dataset by {len(dates)} specific dates")
+            filtered_imgs, filtered_md = filter_dataset_by_specific_dates(
+                dataset, dates, export=False, format=format
+            )
+            # Update dataset with filtered data
+            dataset.imgs = filtered_imgs
+            dataset.md = filtered_md
+            logger.success(f"Dataset filtered to {len(filtered_imgs)} images and {len(filtered_md)} metadata rows")
+        elif start_date or end_date:  # Range-based filtering
+            logger.info(f"Filtering dataset by date range: {start_date} to {end_date}")
+            filtered_imgs, filtered_md = filter_dataset_by_date(
+                dataset, start_date, end_date, export=False, format=format
+            )
+            # Update dataset with filtered data
+            dataset.imgs = filtered_imgs
+            dataset.md = filtered_md
+            logger.success(f"Dataset filtered to {len(filtered_imgs)} images and {len(filtered_md)} metadata rows")
         
         if memory_tracking and PSUTIL_AVAILABLE:
             log_memory_usage(logger, "After date filtering")
@@ -1151,7 +1428,17 @@ def load_nexar_dataset(dataset_year="2020", imgs=True, md=True, ncpus=8,
         if imgs and dataset.imgs:
             dataset._export_image_paths(free_memory=free_memory_after_export)
         if md and not dataset.md.empty:
-            dataset._export_metadata(format=format, free_memory=free_memory_after_export)
+            # Standard metadata export
+            dataset._export_metadata(format=format, free_memory=False)  # Don't free memory yet
+            
+            # Also export as GeoParquet if requested
+            if export_geoparquet:
+                dataset._export_geospatial_metadata(format="geoparquet", free_memory=free_memory_after_export)
+            elif free_memory_after_export:
+                # If we didn't export geoparquet but still want to free memory
+                import gc
+                dataset.md = pd.DataFrame()
+                gc.collect()
         
         if memory_tracking and PSUTIL_AVAILABLE and not free_memory_after_export:
             log_memory_usage(logger, "After exporting data")
