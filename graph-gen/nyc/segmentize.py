@@ -435,27 +435,63 @@ class SidewalkSegmentizer(GeoDataProcessor):
             # Load RAPIDS libraries
             import cudf
             import cuspatial
+            import numpy as np
             from shapely.geometry import Point
 
             self.logger.info("Using RAPIDS/cuSpatial for cleanup")
 
             # Load original sidewalks and convert to RAPIDS GeoSeries
             og_sidewalks = gpd.read_file(og_sidewalk_file_path).to_crs(PROJ_FT)['geometry']
-            og_sidewalks_cuspatial = cuspatial.from_geopandas(og_sidewalks)
+            self.logger.info(f"Loaded {len(og_sidewalks)} polygons from sidewalk file")
 
             # Convert segmentized points to RAPIDS GeoSeries
-            segmentized_points_cuspatial = cuspatial.from_geopandas(segmentized_points)
+            segmentized_points_cuspatial = cuspatial.from_geopandas(segmentized_points.geometry)
+            self.logger.info(f"Converted {len(segmentized_points)} points to cuspatial format")
 
-            # Perform intersection check using RAPIDS
-            self.logger.info("Performing intersection check on GPU")
-            intersects_mask = cuspatial.point_in_polygon(
-                segmentized_points_cuspatial.points.xy,
-                og_sidewalks_cuspatial.polygons.xy
-            )
-
-            # Filter points based on intersection results
+            # Process in batches of 30 polygons
+            batch_size = 30
             len_before = len(segmentized_points)
-            segmentized_points = segmentized_points[intersects_mask.to_pandas()]
+            self.logger.info(f"Processing polygons in batches of {batch_size}")
+            
+            # Create a master mask - use numpy array for accumulating results
+            master_mask = np.zeros(len(segmentized_points), dtype=bool)
+            self.logger.info(f"Master mask initialized with shape: {master_mask.shape}")
+            
+            # Process batches of polygons
+            for batch_start in range(0, len(og_sidewalks), batch_size):
+                batch_end = min(batch_start + batch_size, len(og_sidewalks))
+                
+                self.logger.info(f"Processing polygon batch {batch_start//batch_size + 1}/{(len(og_sidewalks) + batch_size - 1)//batch_size}")
+                
+                # Get the current batch of polygons
+                polygon_batch = og_sidewalks.iloc[batch_start:batch_end]
+                
+                # Convert batch to cuspatial
+                polygon_batch_cuspatial = cuspatial.from_geopandas(polygon_batch)
+                
+                # Perform intersection check for this batch
+                self.logger.info(f"Performing intersection check on GPU for batch of {len(polygon_batch)} polygons")
+                try:
+                    batch_mask = cuspatial.point_in_polygon(
+                        segmentized_points_cuspatial,
+                        polygon_batch_cuspatial
+                    )
+
+                    self.logger.info(f"Batch {batch_start//batch_size + 1} processed, mask has shape: {batch_mask.shape}")
+                    
+                    # Convert to numpy and update the master mask with logical OR
+                    batch_mask_np = batch_mask.sum(axis=1).to_numpy().astype(bool)
+                    master_mask = np.logical_or(master_mask, batch_mask_np)
+                    
+                    points_in_batch = np.sum(batch_mask_np)
+                    self.logger.info(f"Batch {batch_start//batch_size + 1} found {points_in_batch} points inside polygons")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing batch {batch_start//batch_size + 1}: {e}")
+                    continue
+            
+            # Filter points based on the master mask
+            segmentized_points = segmentized_points[master_mask]
             len_after = len(segmentized_points)
 
             self.logger.info(f"Segmentized points cleaned up, {len_before} -> {len_after}")
