@@ -1,6 +1,9 @@
 import os
 import geopandas as gpd
+import pickle
+import json
 from utils.logger import get_logger
+from shapely import Point
 
 class GeoMapperBase:
     """Base class for geospatial mapping tools with common utilities."""
@@ -38,7 +41,33 @@ class GeoMapperBase:
             # Add file extension detection:
             if file_path.lower().endswith('.parquet'):
                 self.logger.info(f"Detected Parquet format, using read_parquet()")
-                df = gpd.read_parquet(file_path)
+                try:
+                    df = gpd.read_parquet(file_path)
+                    # Check if this is a proper GeoParquet with geometry column
+                    geom_col = self.detect_geometry_column(df)
+                    if geom_col is None:
+                        self.logger.warning(f"No geometry column found in parquet file, attempting to detect spatial data")
+                        # Try to find columns that might represent coordinates
+                        potential_x_cols = [col for col in df.columns if col.lower() in ['x', 'lon', 'longitude', 'easting']]
+                        potential_y_cols = [col for col in df.columns if col.lower() in ['y', 'lat', 'latitude', 'northing']]
+                        
+                        if potential_x_cols and potential_y_cols:
+                            x_col = potential_x_cols[0]
+                            y_col = potential_y_cols[0]
+                            self.logger.info(f"Converting columns {x_col} and {y_col} to geometry")
+                            # Create geometry column from coordinates
+                            df['geometry'] = [Point(x, y) for x, y in zip(df[x_col], df[y_col])]
+                            df = gpd.GeoDataFrame(df, geometry='geometry')
+                            if crs is not None:
+                                df.set_crs(crs, inplace=True)
+                        else:
+                            self.logger.error(f"Could not identify geometry column or coordinate columns in {file_path}")
+                except ImportError:
+                    self.logger.error(f"Failed to read GeoParquet: pyarrow package may be missing")
+                    return None
+                except Exception as e:
+                    self.logger.error(f"Failed to read GeoParquet: {e}")
+                    return None
             else:
                 df = gpd.read_file(file_path)
             
@@ -254,4 +283,60 @@ class GeoMapperBase:
             return os.path.exists(output_dir)
         except Exception as e:
             self.logger.error(f"Failed to create output directory {output_dir}: {e}")
+            return False
+            
+    def detect_geometry_column(self, df):
+        """
+        Detect the geometry column in a GeoDataFrame or DataFrame
+        
+        Parameters:
+        -----------
+        df : gpd.GeoDataFrame or pd.DataFrame
+            DataFrame to examine
+            
+        Returns:
+        --------
+        str or None
+            Name of the detected geometry column, or None if not found
+        """
+        try:
+            # If it's already a proper GeoDataFrame with active geometry
+            if hasattr(df, '_geometry_column_name') and df._geometry_column_name:
+                return df._geometry_column_name
+                
+            # Check if there's a column named 'geometry' (the default)
+            if 'geometry' in df.columns:
+                return 'geometry'
+                
+            # Look for columns that might contain geometry objects
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    # Check the first non-null value
+                    sample = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
+                    if sample and hasattr(sample, 'geom_type'):
+                        return col
+                        
+            return None
+        except Exception as e:
+            self.logger.error(f"Error detecting geometry column: {e}")
+            return None
+            
+    def save_outputs(self, merged_df, mapping_dict, mapping_df, output_prefix, output_dir):
+        """Save mapping outputs to disk."""
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Save the mapping dataframe as parquet only
+            mapping_parquet = os.path.join(output_dir, f"{output_prefix}_mapping.parquet")
+            self.logger.info(f"Saving mapping dataframe to {mapping_parquet}")
+            try:
+                mapping_df.to_parquet(mapping_parquet, index=False)
+                self.logger.info(f"Successfully saved mapping dataframe to Parquet")
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to save mapping Parquet: {e}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error saving outputs: {e}")
             return False

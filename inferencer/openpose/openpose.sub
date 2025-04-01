@@ -34,7 +34,7 @@ echo "Using output directory: $OUTPUT_DIR"
 # Verify paths
 echo "Checking file paths:"
 echo "File list exists: $(ls -la $FILE_LIST 2>/dev/null && echo Yes || echo No)"
-echo "Model path exists: $(ls -la /share/ju/autoglancing/sub/pytorch-openpose/model/body_pose_model.pth 2>/dev/null && echo Yes || echo No)"
+echo "Model path exists: $(ls -la /share/ju/deos2ac/sub/pytorch-openpose/model/body_pose_model.pth 2>/dev/null && echo Yes || echo No)"
 echo "Output directory exists: $(ls -la $OUTPUT_DIR 2>/dev/null && echo Yes || echo No)"
 
 # Create output directory if it doesn't exist
@@ -42,13 +42,13 @@ mkdir -p $OUTPUT_DIR
 
 # Activate virtual environment if needed
 echo "Activating conda environment..."
-source activate /share/ju/autoglancing/conda/pytorch-openpose
+source activate /share/ju/deos2ac/conda/pytorch-openpose
 
 # Run the script with a larger batch size
 python slurm_runner.py \
   --file-list $FILE_LIST \
   --output-dir $OUTPUT_DIR \
-  --model-path /share/ju/autoglancing/sub/pytorch-openpose/model/body_pose_model.pth \
+  --model-path /share/ju/deos2ac/sub/pytorch-openpose/model/body_pose_model.pth \
   --batch-size 512 \
   --confidence 0.4 \
   --min-keypoints 4 \

@@ -10,6 +10,6 @@
 #SBATCH --partition=pierson
 
 source /home/mwf62/.bashrc
-source activate /share/ju/autoglancing/conda/autoglancing 
+source activate /share/ju/deos2ac/conda/deos2ac 
 
-python ../io.py --dataset_year=2020 --dates '["10-6-2020", "10-8-2020", "10-13-2020", "10-15-2020", "10-20-2020", "10-22-2020", "10-27-2020", "10-29-2020", "11-3-2020", "11-5-2020", "11-10-2020", "11-12-2020"]' --ncpus=12 --imgs=True --md=True --export_geoparquet=True
+python ../nexar_2020.py --dates '["10-6-2020", "10-8-2020", "10-13-2020", "10-15-2020", "10-20-2020", "10-22-2020", "10-27-2020", "10-29-2020", "11-3-2020", "11-5-2020", "11-10-2020", "11-12-2020"]' --ncpus=12 --imgs=True --md=True --export=True --export_geoparquet=True

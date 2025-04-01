@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 logger.setLevel("INFO")
 
 # Define project root for test resources
-project_root = Path("/share/ju/autoglancing")
+project_root = Path("/share/ju/deos2ac")
 
 
 class TestNexar2020Dataset(unittest.TestCase):

@@ -302,7 +302,7 @@ class SidewalkWidthCalculator(GeoDataProcessor):
             self.logger.error(f"Error in get_avg_distances at index {row.name}: {e}")
             return []
 
-    def clamp_sidewalk_widths(self, df_segments, lower_percentile=0.1, upper_percentile=99.9):
+    def clamp_sidewalk_widths(self, df_segments, lower_percentile=0.5, upper_percentile=99.5):
         """
         Clamp sidewalk widths to remove extreme outliers
         
@@ -648,7 +648,7 @@ class SidewalkWidthCalculator(GeoDataProcessor):
                 return False
             
             # Output statistics before clamping
-            width_stats = df_segments['width'].describe([0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
+            width_stats = df_segments['width'].describe([0.0001, 0.001, 0.01, 0.05, 0.5, 0.95, 0.99, 0.999, 0.99999])
             self.logger.info(f"Sidewalk width statistics before clamping (feet):\n{width_stats}")
             
             # Apply width clamping if enabled

@@ -170,5 +170,13 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# add ANY directory called 'log' to your .gitignore, even if its nested 
+# Ignore all directories named 'log', even if nested
 **/log/
+**/logs/
+
+# Ignore any weight files ending in .pt 
+*.pt
+
+# add data directory and all nested to gitignore
+data/
+conda/

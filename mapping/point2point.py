@@ -4,9 +4,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 from tqdm import tqdm
-import pickle
 import fire
-import json
 
 # Import base class
 from mapping.geo_mapper_base import GeoMapperBase
@@ -21,184 +19,182 @@ class PointMapper(GeoMapperBase):
     def spatial_join_nearest(self, left_df, right_df, left_id_col, right_id_col, max_distance=None):
         """
         Perform spatial join to find nearest point in right_df for each point in left_df
-        
-        Parameters:
-        -----------
-        left_df : gpd.GeoDataFrame
-            First geodataframe (points to match)
-        right_df : gpd.GeoDataFrame
-            Second geodataframe (points to match to)
-        left_id_col : str
-            Column name for the ID in left_df
-        right_id_col : str
-            Column name for the ID in right_df
-        max_distance : float, optional
-            Maximum distance for a match, in CRS units
-            
-        Returns:
-        --------
-        tuple
-            (merged_df, mapping_dict) or (None, None) if join fails
         """
         try:
             if left_df is None or right_df is None:
                 self.logger.error("One or both input dataframes are None")
                 return None, None
                 
+            # Make copies to avoid modifying originals
+            left_df = left_df.copy()
+            right_df = right_df.copy()
+                
+            # Create index-based IDs if columns don't exist
             if left_id_col not in left_df.columns:
-                self.logger.error(f"Left ID column '{left_id_col}' not found in left dataframe")
-                return None, None
-                
+                self.logger.warning(f"Left ID column '{left_id_col}' not found. Using index as ID.")
+                left_df[left_id_col] = left_df.index.astype(str)  # Convert to string for safer joins
+                    
             if right_id_col not in right_df.columns:
-                self.logger.error(f"Right ID column '{right_id_col}' not found in right dataframe")
-                return None, None
-                
+                self.logger.warning(f"Right ID column '{right_id_col}' not found. Using index as ID.")
+                right_df[right_id_col] = right_df.index.astype(str)  # Convert to string for safer joins
+            
             # Validate geometries
             if not all(isinstance(geom, Point) for geom in left_df.geometry):
                 self.logger.warning("Not all geometries in left_df are points, results may be unexpected")
-                
+                    
             if not all(isinstance(geom, Point) for geom in right_df.geometry):
                 self.logger.warning("Not all geometries in right_df are points, results may be unexpected")
-                
-            self.logger.info(f"Performing spatial join for {len(left_df)} left points and {len(right_df)} right points")
             
-            # Create R-tree spatial index on right_df for efficient nearest-neighbor search
-            self.logger.info("Building spatial index on right dataframe")
-            right_sindex = right_df.sindex
+            self.logger.info(f"Performing vectorized spatial join for {len(left_df)} left points and {len(right_df)} right points")
             
-            # Prepare result containers
-            merged_data = []
+            # Create slim dataframes with ONLY the columns we absolutely need
+            # CRITICAL: Include the ID columns explicitly
+            left_slim = left_df[[left_id_col, 'geometry']].copy()
+            right_slim = right_df[[right_id_col, 'geometry']].copy()
+            
+            # Perform the nearest join
+            self.logger.info("Using sjoin_nearest for vectorized processing")
+            joined = gpd.sjoin_nearest(
+                left_slim, 
+                right_slim,
+                how="left", 
+                max_distance=max_distance,
+                distance_col="distance"
+            )
+            
+            # Debug joined dataframe columns
+            self.logger.debug(f"Columns in joined dataframe: {joined.columns.tolist()}")
+            
+            # Check for expected columns and handle missing ones
+            right_id_joined = f"{right_id_col}_right"
+            if right_id_joined not in joined.columns:
+                self.logger.error(f"Expected right ID column '{right_id_joined}' not found in joined result")
+                self.logger.error(f"Available columns: {joined.columns.tolist()}")
+                # Try to find alternative column names that might contain right IDs
+                potential_id_cols = [col for col in joined.columns if "right" in col.lower() or "index" in col.lower()]
+                self.logger.info(f"Potential ID columns: {potential_id_cols}")
+                if potential_id_cols:
+                    right_id_joined = potential_id_cols[0]
+                    self.logger.warning(f"Using '{right_id_joined}' as right ID column")
+                else:
+                    return None, None
+            
+            # Create the mapping dictionary with safer approach
             mapping_dict = {}
+            for _, row in joined.iterrows():
+                if left_id_col in row and right_id_joined in row and not pd.isna(row[right_id_joined]):
+                    mapping_dict[row[left_id_col]] = row[right_id_joined]
             
-            # For each point in left_df, find nearest in right_df
-            for idx, left_row in tqdm(left_df.iterrows(), total=len(left_df), desc="Matching points"):
-                left_point = left_row.geometry
-                left_id = left_row[left_id_col]
-                
-                # Query spatial index for candidate matches
-                possible_matches_idx = list(right_sindex.nearest(left_point.bounds, 10))
-                
-                if not possible_matches_idx:
-                    self.logger.debug(f"No candidate matches found for point {left_id}")
-                    continue
-                    
-                possible_matches = right_df.iloc[possible_matches_idx]
-                
-                # Calculate distances and find the nearest
-                distances = possible_matches.geometry.distance(left_point)
-                nearest_idx = distances.idxmin()
-                min_distance = distances.min()
-                
-                # Check max distance if specified
-                if max_distance is not None and min_distance > max_distance:
-                    self.logger.debug(f"Point {left_id} has no match within {max_distance} units")
-                    continue
-                    
-                # Get the matched right row
-                right_row = right_df.loc[nearest_idx]
-                right_id = right_row[right_id_col]
-                
-                # Store the matching
-                mapping_dict[left_id] = right_id
-                
-                # Create merged row
-                merged_row = left_row.to_dict()
-                merged_row.update({
-                    f"right_{key}": value for key, value in right_row.to_dict().items()
-                    if key != 'geometry'
-                })
-                merged_row['distance'] = min_distance
-                merged_data.append(merged_row)
-                
-            # Create merged dataframe
-            if not merged_data:
-                self.logger.warning("No matches found")
+            # Remove rows without a match
+            joined = joined.dropna(subset=[right_id_joined])
+            
+            if len(joined) == 0:
+                self.logger.warning("No matches found after spatial join")
                 return None, None
+            
+            # Merge with the full left dataframe to get all attributes
+            # Make sure to use the index for joining to preserve the relationship
+            merged_df = left_df.merge(
+                joined[["distance", right_id_joined]],
+                left_index=True, 
+                right_index=True
+            )
+            
+            # Now merge with right dataframe to get all right attributes
+            merged_df = merged_df.merge(
+                right_df,
+                left_on=right_id_joined,
+                right_on=right_id_col,
+                suffixes=('', '_right')
+            )
+
+            # Fix for multiple geometry columns and create a slim mapping dataframe
+            self.logger.info("Creating mapping dataframe without geometry columns")
+
+            # Create a slim version with just the mapping info
+            mapping_df = pd.DataFrame({
+                'left_id': merged_df[left_id_col],
+                'right_id': merged_df[right_id_col],
+                'distance': merged_df['distance']
+            })
+
+            match_percentage = (len(merged_df)/len(left_df))*100
+            self.logger.info(f"Successfully matched {len(merged_df)} points ({match_percentage:.1f}%)")
+
+            # Return both the full merged df for analysis and the slim mapping df for output
+            return merged_df, mapping_dict, mapping_df
                 
-            merged_df = gpd.GeoDataFrame(merged_data, crs=left_df.crs)
+        except Exception as e:
+            import traceback
+            self.logger.error(f"Error in spatial join: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return None, None
+
+    def spatial_join_nearest_vectorized(self, left_df, right_df, left_id_col, right_id_col, max_distance=None):
+        """Vectorized spatial join - much faster than point-by-point iteration"""
+        try:
+            self.logger.info("Performing vectorized spatial join")
+            
+            # Handle ID columns
+            if left_id_col not in left_df.columns:
+                self.logger.warning(f"Left ID column '{left_id_col}' not found. Using index as ID.")
+                left_df[left_id_col] = left_df.index
+                
+            if right_id_col not in right_df.columns:
+                self.logger.warning(f"Right ID column '{right_id_col}' not found. Using index as ID.")
+                right_df[right_id_col] = right_df.index
+            
+            # Use GeoPandas' built-in spatial join with 'nearest' op
+            self.logger.info("Using sjoin_nearest for vectorized processing")
+            
+            # Create a copy of the dataframes with only necessary columns to reduce memory usage
+            left_slim = left_df[[left_id_col, 'geometry']].copy()
+            right_slim = right_df[[right_id_col, 'geometry']].copy()
+            
+            # Perform the nearest join
+            joined = gpd.sjoin_nearest(
+                left_slim, 
+                right_slim,
+                how="left", 
+                max_distance=max_distance,
+                distance_col="distance"
+            )
+            
+            # Create the mapping dictionary
+            mapping_dict = dict(zip(joined[left_id_col], joined[f"{right_id_col}_right"]))
+            
+            # Remove rows without a match
+            joined = joined.dropna(subset=[f"{right_id_col}_right"])
+            
+            # Merge with the full right dataframe to get all attributes
+            merged_df = left_df.merge(
+                joined[["distance", f"{right_id_col}_right"]], 
+                left_index=True, 
+                right_index=True
+            )
+            
+            # Now merge with right dataframe to get all right attributes
+            merged_df = merged_df.merge(
+                right_df,
+                left_on=f"{right_id_col}_right",
+                right_on=right_id_col,
+                suffixes=('', '_right')
+            )
             
             match_percentage = (len(merged_df)/len(left_df))*100
             self.logger.info(f"Successfully matched {len(merged_df)} points ({match_percentage:.1f}%)")
+            
             return merged_df, mapping_dict
+            
         except Exception as e:
-            self.logger.error(f"Error in spatial_join_nearest: {e}")
+            import traceback
+            self.logger.error(f"Error in vectorized spatial join: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             return None, None
-
-    def save_outputs(self, merged_df, mapping_dict, output_prefix, output_dir):
-        """
-        Save the merged dataframe and mapping dictionary to files
-        
-        Parameters:
-        -----------
-        merged_df : gpd.GeoDataFrame
-            Merged geodataframe
-        mapping_dict : dict
-            Mapping dictionary of left_id -> right_id
-        output_prefix : str
-            Prefix for output filenames
-        output_dir : str
-            Directory to save outputs
-            
-        Returns:
-        --------
-        bool
-            True if saving succeeded, False otherwise
-        """
-        try:
-            if merged_df is None or mapping_dict is None:
-                self.logger.error("Merged dataframe or mapping dictionary is None")
-                return False
-                
-            # Ensure output directory exists using base class method
-            if not self.ensure_output_directory(output_dir):
-                return False
-                
-            # Save merged dataframe using base class method
-            merged_file = os.path.join(output_dir, f"{output_prefix}_merged.geojson")
-            self.logger.info(f"Saving merged dataframe to {merged_file}")
-            if not self.save_geojson(merged_df, merged_file):
-                return False
-            
-            # Save mapping dictionary
-            mapping_file = os.path.join(output_dir, f"{output_prefix}_mapping.pickle")
-            self.logger.info(f"Saving mapping dictionary to {mapping_file}")
-            try:
-                with open(mapping_file, 'wb') as f:
-                    pickle.dump(mapping_dict, f)
-            except Exception as e:
-                self.logger.error(f"Failed to save mapping dictionary: {e}")
-                return False
-            
-            # Also save a JSON version for better interoperability
-            json_file = os.path.join(output_dir, f"{output_prefix}_mapping.json") 
-            self.logger.info(f"Saving JSON mapping to {json_file}")
-            try:
-                with open(json_file, 'w') as f:
-                    # Convert all keys to strings for JSON compatibility
-                    json_dict = {str(k): str(v) for k, v in mapping_dict.items()}
-                    json.dump(json_dict, f, indent=2)
-            except Exception as e:
-                self.logger.error(f"Failed to save JSON mapping: {e}")
-                # Continue even if JSON save fails
-                
-            # Save as GeoParquet option
-            try:
-                parquet_file = os.path.join(output_dir, f"{output_prefix}_merged.parquet")
-                self.logger.info(f"Also saving as GeoParquet to {parquet_file}")
-                self.save_geoparquet(merged_df, parquet_file)
-                # Continue even if GeoParquet save fails
-            except Exception as e:
-                self.logger.warning(f"Failed to save as GeoParquet (optional): {e}")
-                
-            self.logger.info(f"Successfully saved outputs with prefix {output_prefix}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Error saving outputs: {e}")
-            return False
 
     def map(self, left_file, right_file, 
             left_id_col="id", right_id_col="id", 
-            left_crs=None, right_crs=None, target_crs=None, 
+            target_crs=None, projected_crs=None,
             max_distance=None, output_prefix="point_mapping", 
             output_dir="output/mappings"):
         """
@@ -209,10 +205,12 @@ class PointMapper(GeoMapperBase):
             right_file: Path to the right geodataframe file (reference points)
             left_id_col: Column name for the ID in left_df (default: "id")
             right_id_col: Column name for the ID in right_df (default: "id")
-            left_crs: CRS of the left geodataframe (optional)
-            right_crs: CRS of the right geodataframe (optional)
             target_crs: Target CRS for the mapping, if None use left_crs (optional)
+            projected_crs: Projected CRS for accurate distance calculations (optional)
+                If provided, data will be projected to this CRS before matching
+                Example: "EPSG:26918" for UTM zone 18N
             max_distance: Maximum distance for a match, in target_crs units (optional)
+                Note: If using projected_crs, this will be in meters
             output_prefix: Prefix for output filenames (default: "point_mapping")
             output_dir: Directory to save outputs (default: "output/mappings")
             
@@ -222,17 +220,21 @@ class PointMapper(GeoMapperBase):
         try:
             self.logger.info("Starting point-to-point mapping process")
             
-            # Load left dataframe using base class method
-            left_df = self.read_geodataframe(left_file, left_crs, name="left dataset")
+            # Load left dataframe using base class method - CRS will be determined from the file
+            left_df = self.read_geodataframe(left_file, name="left dataset")
             if left_df is None:
                 return False
                 
-            # Load right dataframe using base class method
-            right_df = self.read_geodataframe(right_file, right_crs, name="right dataset")
+            # Load right dataframe using base class method - CRS will be determined from the file
+            right_df = self.read_geodataframe(right_file, name="right dataset")
             if right_df is None:
                 return False
             
-            # Detect geometry columns
+            # Log the detected CRS
+            self.logger.info(f"Left dataset CRS: {left_df.crs}")
+            self.logger.info(f"Right dataset CRS: {right_df.crs}")
+            
+            # Detect geometry columns using base class method
             left_geom_col = self.detect_geometry_column(left_df)
             right_geom_col = self.detect_geometry_column(right_df)
             
@@ -257,14 +259,42 @@ class PointMapper(GeoMapperBase):
             if left_df is None or right_df is None:
                 return False
                 
+            # Project to a projected CRS if specified
+            if projected_crs:
+                self.logger.info(f"Projecting data to {projected_crs} for accurate distance measurements")
+                try:
+                    left_df = left_df.to_crs(projected_crs)
+                    right_df = right_df.to_crs(projected_crs)
+                    self.logger.info(f"Successfully projected data. Distance units will be in the projected CRS units (usually meters).")
+                    
+                    # If max_distance was specified, inform the user about units
+                    if max_distance is not None:
+                        self.logger.info(f"Using max_distance={max_distance} in {projected_crs} units")
+                except Exception as e:
+                    self.logger.error(f"Error projecting data: {e}")
+                    return False
+            else:
+                # Warn if using geographic CRS for distance calculations
+                if left_df.crs.is_geographic:
+                    self.logger.warning("Using a geographic CRS for distance calculations. "
+                                        "Consider specifying a projected_crs for more accurate results.")
+                    
+                    if max_distance is not None:
+                        self.logger.warning(f"Your max_distance={max_distance} is in degrees, which may not be what you expect.")
+                        # Ask for confirmation
+                        confirmation = input(f"Continue with max_distance={max_distance} in degrees? [y/N]: ")
+                        if confirmation.lower() not in ['y', 'yes']:
+                            self.logger.info("Operation canceled. Please specify a projected_crs.")
+                            return False
+                
             # Perform spatial join
-            merged_df, mapping_dict = self.spatial_join_nearest(
+            merged_df, mapping_dict, mapping_df = self.spatial_join_nearest(
                 left_df, right_df, left_id_col, right_id_col, max_distance)
             if merged_df is None or mapping_dict is None:
                 return False
                 
-            # Save outputs
-            success = self.save_outputs(merged_df, mapping_dict, output_prefix, output_dir)
+            # Save outputs using base class method, passing the slim mapping dataframe
+            success = self.save_outputs(merged_df, mapping_dict, mapping_df, output_prefix, output_dir)
             
             if success:
                 self.logger.info("Point-to-point mapping completed successfully")
@@ -275,42 +305,6 @@ class PointMapper(GeoMapperBase):
         except Exception as e:
             self.logger.error(f"Unhandled exception in map method: {e}")
             return False
-
-    def detect_geometry_column(self, df):
-        """
-        Detect the geometry column in a GeoDataFrame or DataFrame
-        
-        Parameters:
-        -----------
-        df : gpd.GeoDataFrame or pd.DataFrame
-            DataFrame to examine
-            
-        Returns:
-        --------
-        str or None
-            Name of the detected geometry column, or None if not found
-        """
-        try:
-            # If it's already a proper GeoDataFrame with active geometry
-            if hasattr(df, '_geometry_column_name') and df._geometry_column_name:
-                return df._geometry_column_name
-                
-            # Check if there's a column named 'geometry' (the default)
-            if 'geometry' in df.columns:
-                return 'geometry'
-                
-            # Look for columns that might contain geometry objects
-            for col in df.columns:
-                if df[col].dtype == 'object':
-                    # Check the first non-null value
-                    sample = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
-                    if sample and hasattr(sample, 'geom_type'):
-                        return col
-                        
-            return None
-        except Exception as e:
-            self.logger.error(f"Error detecting geometry column: {e}")
-            return None
 
 
 if __name__ == "__main__":
