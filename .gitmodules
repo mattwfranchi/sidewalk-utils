@@ -1,3 +1,6 @@
 [submodule "sub/pytorch-openpose"]
 	path = sub/pytorch-openpose
 	url = git@github.com:Hzzone/pytorch-openpose.git
+[submodule "sub/mesa-examples"]
+	path = sub/mesa-examples
+	url = git@github.com:projectmesa/mesa-examples.git
