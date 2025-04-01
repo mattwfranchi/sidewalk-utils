@@ -20,7 +20,7 @@ class SidewalkSegmentizer(GeoDataProcessor):
 
     def clip_to_neighborhood(self, data_gdf, nta_gdf, neighborhood_name):
         """
-        Clip geodataframe to a specific neighborhood
+        Clip geodataframe to a specific neighborhoodgi
         
         Parameters:
         -----------
