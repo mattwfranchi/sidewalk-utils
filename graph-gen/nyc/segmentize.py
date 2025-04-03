@@ -436,6 +436,7 @@ class SidewalkSegmentizer(GeoDataProcessor):
             import cudf
             import cuspatial
             import numpy as np
+            import cupy as cp
             from shapely.geometry import Point
 
             self.logger.info("Using RAPIDS/cuSpatial for cleanup")
@@ -448,47 +449,69 @@ class SidewalkSegmentizer(GeoDataProcessor):
             segmentized_points_cuspatial = cuspatial.from_geopandas(segmentized_points.geometry)
             self.logger.info(f"Converted {len(segmentized_points)} points to cuspatial format")
 
-            # Process in batches of 30 polygons
-            batch_size = 30
+            # Convert entire sidewalk dataset to cuSpatial at once
+            self.logger.info("Converting all polygons to cuSpatial format at once")
+            og_sidewalks_cuspatial = cuspatial.from_geopandas(og_sidewalks)
+            
+            # Process in batches of 30 polygons due to cuSpatial limitation
+            batch_size = 30  # cuSpatial maximum
+            num_streams = 256  # Number of parallel streams to use
             len_before = len(segmentized_points)
-            self.logger.info(f"Processing polygons in batches of {batch_size}")
             
-            # Create a master mask - use numpy array for accumulating results
+            # Create a master mask for results
             master_mask = np.zeros(len(segmentized_points), dtype=bool)
-            self.logger.info(f"Master mask initialized with shape: {master_mask.shape}")
-            
-            # Process batches of polygons
-            for batch_start in range(0, len(og_sidewalks), batch_size):
-                batch_end = min(batch_start + batch_size, len(og_sidewalks))
-                
-                self.logger.info(f"Processing polygon batch {batch_start//batch_size + 1}/{(len(og_sidewalks) + batch_size - 1)//batch_size}")
-                
-                # Get the current batch of polygons
-                polygon_batch = og_sidewalks.iloc[batch_start:batch_end]
-                
-                # Convert batch to cuspatial
-                polygon_batch_cuspatial = cuspatial.from_geopandas(polygon_batch)
-                
-                # Perform intersection check for this batch
-                self.logger.info(f"Performing intersection check on GPU for batch of {len(polygon_batch)} polygons")
-                try:
-                    batch_mask = cuspatial.point_in_polygon(
-                        segmentized_points_cuspatial,
-                        polygon_batch_cuspatial
-                    )
+            self.logger.info(f"Processing {len(og_sidewalks)} polygons with {num_streams} parallel streams")
 
-                    self.logger.info(f"Batch {batch_start//batch_size + 1} processed, mask has shape: {batch_mask.shape}")
+            # Calculate number of batches
+            num_batches = (len(og_sidewalks) + batch_size - 1) // batch_size
+            
+            # Process in super-batches to maximize GPU utilization
+            for super_batch_start in range(0, num_batches, num_streams):
+                super_batch_end = min(super_batch_start + num_streams, num_batches)
+                
+                # Create streams for parallel execution
+                num_streams_to_use = super_batch_end - super_batch_start
+                streams = [cp.cuda.Stream(non_blocking=True) for _ in range(num_streams_to_use)]
+                batch_results = []
+                
+                # Launch work on multiple streams
+                for stream_idx in range(num_streams_to_use):
+                    batch_num = super_batch_start + stream_idx + 1
+                    batch_start = (batch_num - 1) * batch_size
+                    batch_end = min(batch_start + batch_size, len(og_sidewalks))
+                    
+                    self.logger.info(f"Queueing polygon batch {batch_num}/{num_batches} (indices {batch_start}:{batch_end})")
+                    
+                    # Process in stream context
+                    with streams[stream_idx]:
+                        try:
+                            # Extract the batch using iloc directly on the cuSpatial GeoSeries
+                            polygon_batch_cuspatial = og_sidewalks_cuspatial.iloc[batch_start:batch_end]
+                            
+                            # Perform intersection check for this batch
+                            batch_mask = cuspatial.point_in_polygon(
+                                segmentized_points_cuspatial,
+                                polygon_batch_cuspatial
+                            )
+                            
+                            # Store result for this batch with its stream
+                            batch_results.append((batch_mask, streams[stream_idx], batch_num))
+                        except Exception as e:
+                            self.logger.error(f"Error processing batch {batch_num} in stream {stream_idx}: {e}")
+                
+                # Synchronize and process results
+                for batch_mask, stream, batch_num in batch_results:
+                    # Wait for this stream to complete
+                    stream.synchronize()
                     
                     # Convert to numpy and update the master mask with logical OR
                     batch_mask_np = batch_mask.sum(axis=1).to_numpy().astype(bool)
                     master_mask = np.logical_or(master_mask, batch_mask_np)
                     
                     points_in_batch = np.sum(batch_mask_np)
-                    self.logger.info(f"Batch {batch_start//batch_size + 1} found {points_in_batch} points inside polygons")
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing batch {batch_start//batch_size + 1}: {e}")
-                    continue
+                    self.logger.info(f"Batch {batch_num} found {points_in_batch} points inside polygons")
+                    # Log running total of points contained
+                    self.logger.info(f"Total points in polygons so far: {np.sum(master_mask)}")
             
             # Filter points based on the master mask
             segmentized_points = segmentized_points[master_mask]
@@ -711,6 +734,30 @@ class SidewalkSegmentizer(GeoDataProcessor):
                 if point2 not in point_adjacency[point1]:
                     point_adjacency[point1].append(point2)
             
+            # After processing cross-segment adjacencies, add within-segment adjacencies
+            self.logger.info("Adding within-segment adjacency relationships")
+            
+            # Group points by segment ID
+            segment_point_groups = points_df.groupby('level_0')
+            
+            # Process each segment
+            for segment_id, group in segment_point_groups:
+                points = group[geometry_column].tolist()
+                indices = group.index.tolist()
+                
+                # For smaller segments, use a direct approach
+                for i in range(len(points)):
+                    for j in range(i + 1, len(points)):
+                        if points[i].distance(points[j]) <= point_distance_threshold:
+                            idx1 = indices[i]
+                            idx2 = indices[j]
+                            
+                            # Add bidirectional adjacency
+                            if idx2 not in point_adjacency[idx1]:
+                                point_adjacency[idx1].append(idx2)
+                            if idx1 not in point_adjacency[idx2]:
+                                point_adjacency[idx2].append(idx1)
+            
             # Add adjacency information to the points dataframe
             self.logger.info("Adding adjacency information to points dataframe")
             points_df['point_adjacent_ids'] = points_df.index.map(point_adjacency)
@@ -913,7 +960,7 @@ class SidewalkSegmentizer(GeoDataProcessor):
             compute_adj: Whether to compute adjacency relationships (default: True)
             adj_tolerance: Distance tolerance for considering geometries adjacent (default: 0.1 feet)
             point_adjacency: Whether to compute point-level adjacency (default: True)
-            point_distance_threshold: Maximum distance between points to be considered adjacent (default: 1.2 * segmentation_distance)
+            point_distance_threshold: Maximum distance between points to be considered adjacent (default: 1.01 * segmentation_distance)
             
         Returns:
             bool: True if successful, False otherwise
@@ -928,8 +975,8 @@ class SidewalkSegmentizer(GeoDataProcessor):
             # Calculate intelligent default for point_distance_threshold if not specified
             if point_distance_threshold is None:
                 # Use 1.2x the segmentation distance as the default threshold
-                point_distance_threshold = 1.2 * segmentation_distance
-                self.logger.info(f"  - Using auto-calculated point distance threshold: {point_distance_threshold:.2f} feet (1.2 × segmentation distance)")
+                point_distance_threshold = 1.01 * segmentation_distance
+                self.logger.info(f"  - Using auto-calculated point distance threshold: {point_distance_threshold:.2f} feet (1.01 × segmentation distance)")
             else:
                 self.logger.info(f"  - Using manual point distance threshold: {point_distance_threshold} feet")
             
