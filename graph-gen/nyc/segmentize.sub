@@ -1,0 +1,32 @@
+#!/bin/bash
+#SBATCH --job-name=segmentize
+#SBATCH --output=log/segmentize_%j.out
+#SBATCH --error=log/segmentize_%j.err
+#SBATCH --mail-type=ALL
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8   # Increased
+#SBATCH --mem=64gb          # Increased
+#SBATCH --time=24:00:00
+#SBATCH --partition=pierson
+
+# Create logs directory if it doesn't exist
+mkdir -p log
+
+# Optimize CUDA memory allocation
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+export CUDA_LAUNCH_BLOCKING=0
+export OMP_NUM_THREADS=8
+
+echo "Job started at $(date)"
+echo "Running on host: $(hostname)"
+echo "Current working directory: $(pwd)"
+echo "Python version: $(python --version)"
+
+# Activate virtual environment if needed
+echo "Activating conda environment..."
+source activate /share/ju/matt/conda/rapids-25.02
+
+# Run the script with a larger batch size
+python segmentize.py process --i ../../data/nyc/processed/sidewalkwidths_nyc.parquet --o ../../data/nyc/processed/segmentized_with_widths.parquet --compute_adj --segmentation_distance=50

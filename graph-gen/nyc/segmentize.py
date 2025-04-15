@@ -1,544 +1,267 @@
 import os
-import geopandas as gpd
 import pandas as pd
-from tqdm import tqdm
-import warnings
 import fire
-import numpy as np
+from functools import wraps
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple, Union, Callable, Any
+from shapely import Point
+from pathlib import Path
+import geopandas as gpd
 
-# Import constants and logger
+# Import constants
 from data.nyc.c import PROJ_FT
-from data.nyc.io import NYC_DATA_PROCESSING_OUTPUT_DIR
 from geo_processor_base import GeoDataProcessor
+from user import INSTALL_DIR
 
-from functools import partial 
-from shapely.strtree import STRtree
-import multiprocessing
+# Import CPU fallbacks and specialized utils
+from segmentize_cpu import SegmentizeCPUFallbacks
+# Import GPU implementations and utils
+from segmentize_gpu import SegmentizeGPUImplementations
+from segmentize_utils import (
+    segmentize_and_extract_points,
+    prepare_segmentized_dataframe,
+    compute_adjacency,
+    consolidate_corner_points
+)
+
+# Type aliases for improved readability
+GeoDataFrame = gpd.GeoDataFrame
+PathLike = Union[str, Path]
+
+@dataclass
+class ProcessingContext:
+    """
+    Context object to hold processing state for method chaining
+    
+    This object tracks all parameters and intermediate results during the
+    segmentization workflow. It's used both by the process method and
+    the fluent interface methods.
+    """
+    input_path: PathLike
+    output_path: Optional[PathLike] = None
+    segmentation_distance: float = 50
+    adj_tolerance: float = 0.1
+    compute_adj: bool = True
+    point_adjacency: bool = True
+    point_distance_threshold: Optional[float] = None
+    sidewalks_data: Optional[GeoDataFrame] = None  # Original sidewalk geometries
+    segmentized_points: Optional[GeoDataFrame] = None  # Points after segmentization
+    result: Optional[GeoDataFrame] = None  # Final processed result
+    start_time: Optional[pd.Timestamp] = None  # For performance tracking
+    success: bool = False  # Whether processing succeeded
+
+def rapids_or_fallback(fallback_method_name: str) -> Callable:
+    """
+    Decorator to check for RAPIDS availability and fall back to a CPU implementation.
+    
+    This decorator attempts to use GPU-accelerated methods first via the RAPIDS ecosystem
+    (cuDF, cuSpatial). If those libraries aren't available, it automatically falls back
+    to the CPU implementation defined in the SegmentizeCPUFallbacks class.
+    
+    Parameters:
+    -----------
+    fallback_method_name : str
+        Name of the method to call from SegmentizeCPUFallbacks if RAPIDS is not available
+        
+    Returns:
+    --------
+    function
+        Decorated function that automatically falls back to CPU implementation
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+            try:
+                # Try to import RAPIDS libraries
+                import cudf
+                import cuspatial
+                self.logger.info("RAPIDS libraries found, using GPU acceleration")
+                return func(self, *args, **kwargs)
+            except ImportError as e:
+                # If import fails, run the fallback function
+                self.logger.warning(f"RAPIDS libraries not available, falling back to CPU implementation: {e}")
+                
+                # Initialize the CPU fallbacks class if not already done
+                if not hasattr(self, '_cpu_fallbacks'):
+                    self._cpu_fallbacks = SegmentizeCPUFallbacks(self)
+                
+                # Call the appropriate method from the fallbacks class
+                fallback_method = getattr(self._cpu_fallbacks, fallback_method_name)
+                return fallback_method(*args, **kwargs)
+        return wrapper
+    return decorator
 
 class SidewalkSegmentizer(GeoDataProcessor):
-    """Tool for segmentizing sidewalk geometries into points for analysis."""
+    """
+    Tool for segmentizing sidewalk geometries into points for network analysis.
+    """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the SidewalkSegmentizer with its own logger."""
         super().__init__(name=__name__)
-
-    def clip_to_neighborhood(self, data_gdf, nta_gdf, neighborhood_name):
-        """
-        Clip geodataframe to a specific neighborhoodgi
         
-        Parameters:
-        -----------
-        data_gdf : GeoDataFrame
-            Data to clip
-        nta_gdf : GeoDataFrame
-            Neighborhoods GeoDataFrame
-        neighborhood_name : str
-            Name of neighborhood to clip to
-            
-        Returns:
-        --------
-        GeoDataFrame
-            Clipped data or None if operation fails
+        # Prevent duplicate logging by disabling propagation on one logger
+        self.logger.propagate = False  # This prevents messages from being passed up to parent loggers
+        
+        # Initialize CPU fallbacks and GPU implementations (will be lazily created when needed)
+        self._cpu_fallbacks: Optional[SegmentizeCPUFallbacks] = None
+        self._gpu_implementations: Optional[SegmentizeGPUImplementations] = None
+        self._current_ctx: Optional[ProcessingContext] = None  # For fluent interface
+    
+    # Core utility methods
+    def convert_segments_to_points(self, gdf: GeoDataFrame, distance: float = 50) -> GeoDataFrame:
         """
-        try:
-            self.logger.info(f"Clipping data to {neighborhood_name} neighborhood")
-            
-            # Check input validity
-            if data_gdf is None or nta_gdf is None:
-                self.logger.error("Input geodataframes cannot be None")
-                return None
-                
-            if 'NTAName' not in nta_gdf.columns:
-                self.logger.error("NTAName column not found in neighborhood data")
-                return None
-                
-            # Get the specific neighborhood boundary
-            target_nta = nta_gdf[nta_gdf.NTAName == neighborhood_name]
-            
-            if target_nta.empty:
-                self.logger.error(f"Neighborhood '{neighborhood_name}' not found in NTA data")
-                available_neighborhoods = nta_gdf.NTAName.unique().tolist()
-                self.logger.info(f"Available neighborhoods: {available_neighborhoods}")
-                return None
-                
-            # Log neighborhood information
-            nta_area = target_nta.geometry.area.iloc[0]
-            nta_bounds = target_nta.total_bounds
-            self.logger.info(f"Neighborhood area: {nta_area:.2f} square units")
-            self.logger.info(f"Neighborhood bounds [minx, miny, maxx, maxy]: {nta_bounds}")
-            
-            # Calculate initial data stats for comparison
-            initial_count = len(data_gdf)
-            initial_length = data_gdf.geometry.length.sum() if hasattr(data_gdf.geometry.iloc[0], 'length') else None
-            
-            # Perform spatial join
-            try:
-                self.logger.info(f"Performing spatial join operation")
-                clipped_data = gpd.sjoin(data_gdf, target_nta, predicate='within')
-                
-                # Calculate stats after clipping for comparison
-                final_count = len(clipped_data)
-                feature_reduction = ((initial_count - final_count) / initial_count) * 100
-                self.logger.info(f"Clipped data contains {final_count} features "
-                              f"({feature_reduction:.1f}% reduction from original)")
-                
-                if initial_length is not None:
-                    final_length = clipped_data.geometry.length.sum()
-                    length_reduction = ((initial_length - final_length) / initial_length) * 100
-                    self.logger.info(f"Total length reduced from {initial_length:.2f} to {final_length:.2f} units "
-                                  f"({length_reduction:.1f}% reduction)")
-                
-                # Check if clipping produced an empty result
-                if clipped_data.empty:
-                    self.logger.warning("Clipping resulted in empty dataset. Check if the data actually "
-                                     f"intersects with the {neighborhood_name} neighborhood.")
-                
-                return clipped_data
-            except Exception as e:
-                self.logger.error(f"Spatial join operation failed: {e}")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"Error in clip_to_neighborhood: {e}")
-            return None
-
-    def simplify_geometries(self, gdf, tolerance=10):
-        """
-        Simplify geometries with error handling
+        Convert sidewalk segments into regularly spaced points
+        
+        This method takes linear sidewalk geometries and converts them into
+        evenly spaced points along each segment, based on the specified distance.
         
         Parameters:
         -----------
         gdf : GeoDataFrame
-            Input geodataframe
-        tolerance : float
-            Simplification tolerance
-            
-        Returns:
-        --------
-        GeoDataFrame
-            Geodataframe with simplified geometries
-        """
-        try:
-            if gdf is None or gdf.empty:
-                self.logger.error("Cannot simplify empty geodataframe")
-                return None
-                
-            self.logger.info(f"Simplifying geometries with tolerance {tolerance}")
-            
-            # Gather stats before simplification
-            initial_vertex_count = sum(len(g.coords) if hasattr(g, 'coords') 
-                                   else sum(len(geom.coords) for geom in g.geoms) 
-                                   for g in gdf.geometry)
-            initial_lengths = gdf.geometry.length
-            
-            # Create a copy to avoid modifying the original
-            simplified = gdf.copy()
-            
-            # Check geometry validity
-            invalid_count = simplified[~simplified.geometry.is_valid].shape[0]
-            if invalid_count > 0:
-                self.logger.warning(f"Found {invalid_count} invalid geometries ({invalid_count/len(gdf)*100:.1f}%), attempting to fix")
-                simplified.geometry = simplified.geometry.buffer(0)
-                
-            # Apply simplification
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                simplified.geometry = simplified.geometry.simplify(tolerance)
-                
-            # Gather stats after simplification
-            final_vertex_count = sum(len(g.coords) if hasattr(g, 'coords') 
-                                 else sum(len(geom.coords) for geom in g.geoms) 
-                                 for g in simplified.geometry)
-            vertex_reduction = ((initial_vertex_count - final_vertex_count) / initial_vertex_count) * 100
-            self.logger.info(f"Vertices reduced from {initial_vertex_count} to {final_vertex_count} "
-                          f"({vertex_reduction:.1f}% reduction)")
-            
-            # Check how much the geometry lengths changed
-            final_lengths = simplified.geometry.length
-            length_change = ((final_lengths - initial_lengths) / initial_lengths * 100).mean()
-            self.logger.info(f"Average length change after simplification: {length_change:.2f}%")
-            
-            # Validate results
-            error_count = simplified[~simplified.geometry.is_valid].shape[0]
-            if error_count > 0:
-                self.logger.warning(f"{error_count} geometries are invalid after simplification "
-                                 f"({error_count/len(simplified)*100:.1f}%)")
-                
-            empty_count = simplified[simplified.geometry.is_empty].shape[0]
-            if empty_count > 0:
-                self.logger.warning(f"{empty_count} geometries are empty after simplification "
-                                 f"({empty_count/len(simplified)*100:.1f}%)")
-                simplified = simplified[~simplified.geometry.is_empty]
-                
-            self.logger.info(f"Simplification complete, {len(simplified)} valid features remain")
-            return simplified
-            
-        except Exception as e:
-            self.logger.error(f"Error in simplify_geometries: {e}")
-            return None
-
-    def segmentize_and_extract_points(self, gdf, distance=50):
-        """
-        Segmentize geometries and extract unique points
-        
-        Parameters:
-        -----------
-        gdf : GeoDataFrame
-            Input geodataframe
+            Input geodataframe with sidewalk geometries
         distance : float
-            Distance between points in segmentation
+            Distance between points in segmentation (feet)
             
         Returns:
         --------
         GeoDataFrame
-            Geodataframe with point geometries
+            DataFrame containing point geometries derived from the input segments
         """
-        try:
-            if gdf is None or gdf.empty:
-                self.logger.error("Cannot segmentize empty geodataframe")
-                return None
-                
-            self.logger.info(f"Segmentizing geometries at {distance} foot intervals")
-            
-            # Log input geometry statistics
-            total_length = gdf.geometry.length.sum()
-            avg_length = gdf.geometry.length.mean()
-            expected_points = int(total_length / distance)
-            self.logger.info(f"Total length to segmentize: {total_length:.2f} units")
-            self.logger.info(f"Average feature length: {avg_length:.2f} units")
-            self.logger.info(f"Expected point count (estimate): ~{expected_points} points")
-            
-            try:
-                # Segmentize and extract points
-                segmentized = gdf.segmentize(distance).extract_unique_points()
-                
-                # Explode multipoint geometries into individual points
-                self.logger.info("Exploding multipoint geometries")
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    segmentized = segmentized.explode(index_parts=True)
-                    
-                actual_points = len(segmentized)
-                point_ratio = actual_points / expected_points
-                self.logger.info(f"Generated {actual_points} points ({point_ratio:.2f}x the estimate)")
-                
-                # Log spatial distribution stats
-                if len(segmentized) > 0:
-                    bounds = segmentized.total_bounds
-                    area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
-                    point_density = actual_points / area if area > 0 else 0
-                    self.logger.info(f"Point density: {point_density:.6f} points per square unit")
-                    
-                    # Calculate nearest-neighbor distances
-                    try:
-                        sample_size = min(1000, len(segmentized))
-                        if sample_size > 10:  # Only calculate for reasonably sized samples
-                            sample = segmentized.sample(sample_size) if sample_size < len(segmentized) else segmentized
-                            distances = []
-                            for idx, point in sample.items():
-                                if len(sample) > 1:  # Need at least 2 points
-                                    others = sample[sample.index != idx]
-                                    # FIX: Use point directly, not point.geometry
-                                    min_dist = others.distance(point).min()
-                                    distances.append(min_dist)
-                            
-                            if distances:
-                                avg_nn_dist = sum(distances) / len(distances)
-                                self.logger.info(f"Average nearest neighbor distance (sample): {avg_nn_dist:.2f} units")
-                                self.logger.info(f"Min/Max nearest neighbor distance: {min(distances):.2f}/{max(distances):.2f} units")
-                    except Exception as e:
-                        self.logger.warning(f"Could not calculate point distribution stats: {e}")
-                
-                if segmentized.empty:
-                    self.logger.error("No points were generated during segmentization")
-                    return None
-                    
-                return segmentized
-                
-            except Exception as e:
-                self.logger.error(f"Error during segmentization: {e}")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"Error in segmentize_and_extract_points: {e}")
-            return None
-
-    def prepare_segmentized_dataframe(self, segmentized_points, source_gdf):
+        return segmentize_and_extract_points(gdf, distance=distance, logger=self.logger)
+        
+    def prepare_final_dataframe(self, points_gdf: GeoDataFrame, source_gdf: GeoDataFrame) -> GeoDataFrame:
         """
-        Prepare the final segmentized dataframe with attributes - FIXED version
+        Prepare the final point dataframe with attributes from source segments
+        
+        Takes the segmentized points and transfers attributes from the original
+        sidewalk segments that those points were generated from.
         
         Parameters:
         -----------
-        segmentized_points : GeoDataFrame
-            Segmentized point geometries
+        points_gdf : GeoDataFrame
+            GeoDataFrame with segmentized point geometries
         source_gdf : GeoDataFrame
-            Original geodataframe with attributes
+            Original geodataframe with attributes to transfer
             
         Returns:
         --------
         GeoDataFrame
-            Final geodataframe with points and attributes
+            Points with source attributes attached
         """
-        try:
-            if segmentized_points is None or segmentized_points.empty:
-                self.logger.error("Segmentized data is empty")
-                return None
-                
-            if source_gdf is None or source_gdf.empty:
-                self.logger.error("Source data is empty")
-                return None
-                
-            self.logger.info("Preparing final segmentized dataframe")
-            self.logger.info(f"Source data contains {len(source_gdf)} features with {len(source_gdf.columns)} attributes")
-            
-            # Reset index to get level_0 and level_1 columns
-            self.logger.info("Resetting index to get level_0 and level_1 columns")
-            segmentized_df = segmentized_points.reset_index()
-            
-            # Log columns for debugging
-            self.logger.info(f"Columns after reset_index: {segmentized_df.columns.tolist()}")
-            
-            # In your case, the geometry column is named 0 (integer)
-            self.logger.info("Explicitly handling column named 0 as geometry column")
-            
-            # Save the geometries from column 0
-            if 0 in segmentized_df.columns:
-                geometries = segmentized_df[0].copy()
-                self.logger.info(f"Saved {len(geometries)} geometries from column 0")
-            else:
-                self.logger.error("Column 0 not found in segmentized dataframe")
-                return None
-            
-            # Following the exact notebook pattern but with explicit handling of column 0
-            self.logger.info("Merging with original dataframe and handling geometry column")
-            
-            # 1. Merge using level_0 with the original dataframe
-            try:
-                result = segmentized_df.merge(
-                    source_gdf, 
-                    left_on='level_0',
-                    right_index=True
-                )
-                self.logger.info(f"Merged dataframe has {len(result)} rows and {len(result.columns)} columns")
-            except Exception as e:
-                self.logger.error(f"Merge failed: {e}")
-                return None
-            
-            # 2. Drop level_0, level_1, and the original geometry column from source_gdf
-            drop_cols = ['level_0', 'level_1']
-            if 'geometry' in result.columns:
-                drop_cols.append('geometry')
-            result = result.drop(columns=drop_cols, errors='ignore')
-            
-            # 3. Drop column 0 (we've saved the geometries)
-            if 0 in result.columns:
-                result = result.drop(columns=[0])
-            
-            # 4. Add the saved geometries as 'geometry' column
-            result['geometry'] = geometries
-            
-            # 5. Create a new GeoDataFrame with explicit geometry column
-            result = gpd.GeoDataFrame(result, geometry='geometry', crs=segmentized_points.crs)
-            
-            # Log results
-            self.logger.info(f"Final dataframe has {len(result)} points with {len(result.columns)-1} attributes")
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"Error in prepare_segmentized_dataframe: {e}")
-            self.logger.error(f"Error details: {str(e)}")
-            return None
-    def compute_adjacency(self, gdf, tolerance=0.1):
+        return prepare_segmentized_dataframe(points_gdf, source_gdf, logger=self.logger)
+        
+    def compute_segment_adjacency(self, gdf: GeoDataFrame, tolerance: float = 0.1) -> GeoDataFrame:
         """
-        Compute adjacency relationships between sidewalk geometries using vectorized operations
+        Compute adjacency relationships between sidewalk segments
+        
+        Determines which sidewalk segments are adjacent to each other within a
+        specified tolerance distance. This creates the base adjacency network
+        before segmentization into points.
         
         Parameters:
         -----------
         gdf : GeoDataFrame
             Input geodataframe with sidewalk geometries
         tolerance : float
-            Distance tolerance for considering geometries adjacent (in feet)
+            Distance tolerance for considering segments adjacent (feet)
             
         Returns:
         --------
         GeoDataFrame
-            Input geodataframe with additional adjacency columns
+            Input geodataframe with additional 'adjacent_ids' column
         """
-        try:
-            if gdf is None or gdf.empty:
-                self.logger.error("Cannot compute adjacency for empty geodataframe")
-                return None
-                
-            self.logger.info(f"Computing adjacency relationships with tolerance {tolerance}")
-            
-            # Create a spatial index
-            self.logger.info("Building spatial index")
-            sindex = gdf.sindex
-            
-            # Use the nearest method with max_distance to find adjacent geometries
-            self.logger.info(f"Finding adjacent features with vectorized nearest operation (max_distance={tolerance})")
-            nearest_indices = sindex.nearest(
-                gdf.geometry, 
-                return_all=True,  # Get all equidistant neighbors
-                max_distance=tolerance  # Only find neighbors within our tolerance
-            )
-            
-            # Convert results to adjacency dictionary
-            self.logger.info("Processing adjacency results")
-            adjacency_dict = {idx: [] for idx in gdf.index}
-            
-            # Process the nearest indices
-            input_indices, tree_indices = nearest_indices
-            
-            # Use numpy operations for speed
-            input_idx_values = gdf.index.values[input_indices]
-            tree_idx_values = gdf.index.values[tree_indices]
-            
-            # Track progress
-            total_pairs = len(input_indices)
-            self.logger.info(f"Processing {total_pairs} potential adjacency pairs")
-            
-            # Process all pairs at once
-            for i in range(len(input_indices)):
-                source_idx = input_idx_values[i]
-                target_idx = tree_idx_values[i]
-                
-                # Don't add self-adjacency
-                if source_idx != target_idx:
-                    adjacency_dict[source_idx].append(target_idx)
-            
-            # Add adjacency information to the dataframe
-            self.logger.info("Adding adjacency information to dataframe")
-            gdf['adjacent_ids'] = gdf.index.map(adjacency_dict)
-            gdf['adjacency_count'] = gdf['adjacent_ids'].apply(len)
-            
-            # Log adjacency statistics
-            feature_count = len(gdf)
-            avg_adjacency = gdf['adjacency_count'].mean()
-            max_adjacency = gdf['adjacency_count'].max()
-            isolated_count = (gdf['adjacency_count'] == 0).sum()
-            
-            self.logger.info(f"Adjacency statistics:")
-            self.logger.info(f"  - Average adjacent features: {avg_adjacency:.2f}")
-            self.logger.info(f"  - Maximum adjacent features: {max_adjacency}")
-            self.logger.info(f"  - Isolated features: {isolated_count} ({isolated_count/feature_count*100:.1f}%)")
-            
-            return gdf
-            
-        except Exception as e:
-            self.logger.error(f"Error in compute_adjacency: {e}")
-            return None
-
-    def cleanup(self, segmentized_points, og_sidewalk_file_path: str):
-        try:
-            # Load RAPIDS libraries
-            import cudf
-            import cuspatial
-            import numpy as np
-            import cupy as cp
-            from shapely.geometry import Point
-
-            self.logger.info("Using RAPIDS/cuSpatial for cleanup")
-
-            # Load original sidewalks and convert to RAPIDS GeoSeries
-            og_sidewalks = gpd.read_file(og_sidewalk_file_path).to_crs(PROJ_FT)['geometry']
-            self.logger.info(f"Loaded {len(og_sidewalks)} polygons from sidewalk file")
-
-            # Convert segmentized points to RAPIDS GeoSeries
-            segmentized_points_cuspatial = cuspatial.from_geopandas(segmentized_points.geometry)
-            self.logger.info(f"Converted {len(segmentized_points)} points to cuspatial format")
-
-            # Convert entire sidewalk dataset to cuSpatial at once
-            self.logger.info("Converting all polygons to cuSpatial format at once")
-            og_sidewalks_cuspatial = cuspatial.from_geopandas(og_sidewalks)
-            
-            # Process in batches of 30 polygons due to cuSpatial limitation
-            batch_size = 30  # cuSpatial maximum
-            num_streams = 256  # Number of parallel streams to use
-            len_before = len(segmentized_points)
-            
-            # Create a master mask for results
-            master_mask = np.zeros(len(segmentized_points), dtype=bool)
-            self.logger.info(f"Processing {len(og_sidewalks)} polygons with {num_streams} parallel streams")
-
-            # Calculate number of batches
-            num_batches = (len(og_sidewalks) + batch_size - 1) // batch_size
-            
-            # Process in super-batches to maximize GPU utilization
-            for super_batch_start in range(0, num_batches, num_streams):
-                super_batch_end = min(super_batch_start + num_streams, num_batches)
-                
-                # Create streams for parallel execution
-                num_streams_to_use = super_batch_end - super_batch_start
-                streams = [cp.cuda.Stream(non_blocking=True) for _ in range(num_streams_to_use)]
-                batch_results = []
-                
-                # Launch work on multiple streams
-                for stream_idx in range(num_streams_to_use):
-                    batch_num = super_batch_start + stream_idx + 1
-                    batch_start = (batch_num - 1) * batch_size
-                    batch_end = min(batch_start + batch_size, len(og_sidewalks))
-                    
-                    self.logger.info(f"Queueing polygon batch {batch_num}/{num_batches} (indices {batch_start}:{batch_end})")
-                    
-                    # Process in stream context
-                    with streams[stream_idx]:
-                        try:
-                            # Extract the batch using iloc directly on the cuSpatial GeoSeries
-                            polygon_batch_cuspatial = og_sidewalks_cuspatial.iloc[batch_start:batch_end]
-                            
-                            # Perform intersection check for this batch
-                            batch_mask = cuspatial.point_in_polygon(
-                                segmentized_points_cuspatial,
-                                polygon_batch_cuspatial
-                            )
-                            
-                            # Store result for this batch with its stream
-                            batch_results.append((batch_mask, streams[stream_idx], batch_num))
-                        except Exception as e:
-                            self.logger.error(f"Error processing batch {batch_num} in stream {stream_idx}: {e}")
-                
-                # Synchronize and process results
-                for batch_mask, stream, batch_num in batch_results:
-                    # Wait for this stream to complete
-                    stream.synchronize()
-                    
-                    # Convert to numpy and update the master mask with logical OR
-                    batch_mask_np = batch_mask.sum(axis=1).to_numpy().astype(bool)
-                    master_mask = np.logical_or(master_mask, batch_mask_np)
-                    
-                    points_in_batch = np.sum(batch_mask_np)
-                    self.logger.info(f"Batch {batch_num} found {points_in_batch} points inside polygons")
-                    # Log running total of points contained
-                    self.logger.info(f"Total points in polygons so far: {np.sum(master_mask)}")
-            
-            # Filter points based on the master mask
-            segmentized_points = segmentized_points[master_mask]
-            len_after = len(segmentized_points)
-
-            self.logger.info(f"Segmentized points cleaned up, {len_before} -> {len_after}")
-            return segmentized_points
-
-        except ImportError as e:
-            self.logger.warning(f"RAPIDS/cuSpatial not available, falling back to CPU implementation: {e}")
-            return self.cleanup_cpu(segmentized_points, og_sidewalk_file_path)
-
-        except Exception as e:
-            self.logger.error(f"Error in cleanup with RAPIDS/cuSpatial: {e}")
-            return None
-
-    def compute_point_adjacency(self, segmentized_points, source_gdf, point_distance_threshold=10, batch_size=1000):
+        return compute_adjacency(gdf, tolerance=tolerance, logger=self.logger)
+        
+    def merge_nearby_corner_points(self, gdf: GeoDataFrame, min_distance: float = 10) -> GeoDataFrame:
         """
-        Compute adjacency using GPU acceleration via RAPIDS libraries with optimized 
-        implementation for the standard cuSpatial API (no special cross-distance function).
+        Merge points that are too close together at corners
+        
+        After segmentization, points near corners/intersections can be very close 
+        to each other. This method consolidates them to avoid redundancy and improve
+        network topology.
+        
+        Parameters:
+        -----------
+        gdf : GeoDataFrame
+            Input geodataframe with point geometries
+        min_distance : float
+            Minimum distance between points - any closer will be merged (feet)
+            
+        Returns:
+        --------
+        GeoDataFrame
+            Points with nearby corner points consolidated
+        """
+
+        # check if gdf is a geodataframe, if not exit with appropriate error 
+        if not isinstance(gdf, gpd.GeoDataFrame):
+            raise TypeError("Input must be a GeoDataFrame")
+        if gdf.empty:   
+            raise ValueError("Input GeoDataFrame is empty")
+
+        return consolidate_corner_points(gdf, min_distance=min_distance, logger=self.logger)
+
+    # GPU-accelerated methods with CPU fallbacks
+    @rapids_or_fallback(fallback_method_name='sidewalk_network_filter_cpu')
+    def filter_points_with_sidewalk_network(self, segmentized_points: GeoDataFrame, 
+                                           og_sidewalk_file_path: PathLike) -> GeoDataFrame:
+        """
+        Filter segmentized points using GPU-accelerated point-in-polygon operations
+        
+        Ensures that all points created during segmentization fall within actual
+        sidewalk polygons, removing any that may be outside due to geometric operations.
+        Uses GPU acceleration when available.
+        
+        Parameters:
+        -----------
+        segmentized_points : GeoDataFrame
+            Points to filter
+        og_sidewalk_file_path : str or Path
+            Path to original sidewalk polygons file
+            
+        Returns:
+        --------
+        GeoDataFrame
+            Filtered points guaranteed to be within sidewalk polygons
+        """
+        # Import GPU libraries (decorator ensures these imports work)
+        import cudf
+        import cuspatial
+        
+        # Convert to string if it's a Path
+        sidewalk_path = str(og_sidewalk_file_path)
+        
+        # Lazily initialize GPU implementations if needed
+        if not hasattr(self, '_gpu_implementations') or self._gpu_implementations is None:
+            self._gpu_implementations = SegmentizeGPUImplementations(self)
+            
+        # Delegate to GPU implementation
+        return self._gpu_implementations.sidewalk_network_filter(
+            segmentized_points, 
+            sidewalk_path
+        )
+
+    @rapids_or_fallback(fallback_method_name='compute_point_adjacency_parallel')
+    def compute_point_level_adjacency(self, segmentized_points: GeoDataFrame, source_gdf: GeoDataFrame, 
+                                    point_distance_threshold: float = 10, 
+                                    batch_size: int = 1000) -> GeoDataFrame:
+        """
+        Compute adjacency between individual points based on segment adjacency
+        
+        After segmentizing segments into points, this method establishes which points
+        are connected to each other, creating a network graph of points. It uses
+        the segment-level adjacency info to efficiently process only relevant
+        point pairs, rather than checking all possible combinations.
+        
+        Uses GPU acceleration when available, with automatic fallback to CPU.
         
         Parameters:
         -----------
         segmentized_points : GeoDataFrame
             The segmentized points with level_0 indicating the parent segment
         source_gdf : GeoDataFrame
-            The original segments with adjacent_ids column from previous computation
+            The original segments with adjacent_ids column from segment adjacency computation
         point_distance_threshold : float
             Maximum distance between points to be considered adjacent (in feet)
         batch_size : int
@@ -547,415 +270,548 @@ class SidewalkSegmentizer(GeoDataProcessor):
         Returns:
         --------
         GeoDataFrame
-            Points with point-level adjacency information
+            Points with point-level adjacency information in 'point_adjacent_ids' column
         """
-        try:
-            # Try to import RAPIDS libraries
-            try:
-                import cudf
-                import cuspatial
-                from shapely.geometry import Point
-                has_rapids = True
-                self.logger.info("RAPIDS libraries found, using GPU acceleration")
-            except ImportError:
-                has_rapids = False
-                self.logger.warning("RAPIDS libraries not found, falling back to CPU implementation")
-                return self.compute_point_adjacency_parallel(segmentized_points, source_gdf, point_distance_threshold)
-                
-            if 'adjacent_ids' not in source_gdf.columns:
-                self.logger.warning("No adjacency information found in source data, skipping point adjacency")
-                return segmentized_points
-                
-            self.logger.info("Computing point-level adjacency relationships with GPU acceleration")
-            self.logger.info(f"Using point distance threshold of {point_distance_threshold} feet")
+        # Import GPU libraries (decorator ensures these imports work)
+        import cudf
+        import cuspatial
+        
+        # Lazily initialize GPU implementations if needed
+        if not hasattr(self, '_gpu_implementations') or self._gpu_implementations is None:
+            self._gpu_implementations = SegmentizeGPUImplementations(self)
             
-            # Reset index to get segment ID as level_0 column
-            points_df = segmentized_points.reset_index()
-            
-            # Set the active geometry column explicitly
-            if 0 in points_df.columns:
-                points_df = points_df.set_geometry(0)
-                geometry_column = 0  
-            else:
-                self.logger.error("Could not find geometry column in segmentized points")
-                return segmentized_points
-                
-            # Pre-process data for faster lookup
-            self.logger.info("Building segment-to-points mapping for faster lookup")
-            segment_to_points = {}
-            for idx, row in points_df.iterrows():
-                segment_id = row['level_0']
-                if segment_id not in segment_to_points:
-                    segment_to_points[segment_id] = []
-                segment_to_points[segment_id].append((idx, row[geometry_column]))
-            
-            # Get all segment pairs that need processing
-            segment_pairs = []
-            for segment_id in source_gdf.index:
-                if segment_id not in segment_to_points:
-                    continue
-                    
-                adjacent_segment_ids = source_gdf.loc[segment_id, 'adjacent_ids']
-                if not adjacent_segment_ids:
-                    continue
-                    
-                for adj_segment_id in adjacent_segment_ids:
-                    if adj_segment_id in segment_to_points:
-                        segment_pairs.append((segment_id, adj_segment_id))
-            
-            self.logger.info(f"Found {len(segment_pairs)} segment pairs to process")
-            
-            # Create a set to collect adjacency pairs 
-            # Using a set for faster duplicate checking and to ensure unique pairs
-            all_adjacency_pairs = set()
-            
-            # Process segment pairs in batches to avoid GPU memory issues
-            total_pairs = len(segment_pairs)
-            
-            # For large collections, use vectorized operation if possible
-            try:
-                # Try to find an optimal vectorized way to compute distances
-                import inspect
-                if hasattr(cuspatial, "pairwise_point_distance"):
-                    func_sig = inspect.signature(cuspatial.pairwise_point_distance)
-                    self.logger.info(f"Found pairwise_point_distance with signature: {func_sig}")
-                    has_vectorized = True
-                else:
-                    has_vectorized = False
-                    self.logger.info("No vectorized point distance function found")
-            except Exception:
-                has_vectorized = False
-            
-            # Process in batches
-            for batch_start in range(0, total_pairs, batch_size):
-                batch_end = min(batch_start + batch_size, total_pairs)
-                batch = segment_pairs[batch_start:batch_end]
-                
-                self.logger.info(f"Processing batch {batch_start//batch_size + 1}/{(total_pairs + batch_size - 1)//batch_size}")
-                
-                # Process each segment pair in the batch
-                for i in range(len(batch)):
-                    segment_id, adj_segment_id = batch[i]
-                    
-                    # Get points from each segment
-                    segment_points = segment_to_points.get(segment_id, [])
-                    adj_segment_points = segment_to_points.get(adj_segment_id, [])
-                    
-                    if not segment_points or not adj_segment_points:
-                        continue
-                    
-                    # Extract point coordinates and indices
-                    seg1_indices = [idx for idx, _ in segment_points]
-                    seg1_points = [geom for _, geom in segment_points]
-                    
-                    seg2_indices = [idx for idx, _ in adj_segment_points]
-                    seg2_points = [geom for _, geom in adj_segment_points]
-                    
-                    # CPU-based distance calculation is faster for small point sets
-                    # GPU acceleration is better for larger sets
-                    if len(seg1_points) * len(seg2_points) < 100:
-                        # For small sets, just use direct calculation
-                        for i, (idx1, geom1) in enumerate(segment_points):
-                            for j, (idx2, geom2) in enumerate(adj_segment_points):
-                                if geom1.distance(geom2) <= point_distance_threshold:
-                                    all_adjacency_pairs.add((idx1, idx2))
-                                    all_adjacency_pairs.add((idx2, idx1))  # Add bidirectional
-                    else:
-                        # For larger sets, try using GPU acceleration
-                        try:
-                            # Create GPU-accelerated GeoSeries
-                            gpu_points1 = cuspatial.GeoSeries(seg1_points)
-                            gpu_points2 = cuspatial.GeoSeries(seg2_points)
-                            
-                            # Vectorized approach for large point collections
-                            if has_vectorized and len(seg1_points) == len(seg2_points):
-                                try:
-                                    # Try vectorized distance if points have 1:1 correspondence
-                                    self.logger.info("Attempting vectorized distance calculation")
-                                    distances = cuspatial.pairwise_point_distance(gpu_points1, gpu_points2)
-                                    
-                                    # Find points within threshold
-                                    mask = distances.to_pandas() <= point_distance_threshold
-                                    for i in range(len(mask)):
-                                        if mask.iloc[i]:
-                                            all_adjacency_pairs.add((seg1_indices[i], seg2_indices[i]))
-                                            all_adjacency_pairs.add((seg2_indices[i], seg1_indices[i]))
-                                    continue
-                                except Exception as e:
-                                    self.logger.warning(f"Vectorized approach failed: {e}")
-                                    # Fall through to one-by-one approach
-                            
-                            # Convert to pandas for faster processing
-                            gpu_points1_pd = gpu_points1.to_pandas()
-                            gpu_points2_pd = gpu_points2.to_pandas()
-                            
-                            # Process in sub-batches for better GPU utilization
-                            sub_batch_size = 100
-                            for i_start in range(0, len(seg1_points), sub_batch_size):
-                                i_end = min(i_start + sub_batch_size, len(seg1_points))
-                                
-                                for j_start in range(0, len(seg2_points), sub_batch_size):
-                                    j_end = min(j_start + sub_batch_size, len(seg2_points))
-                                    
-                                    # Process this sub-batch
-                                    for i in range(i_start, i_end):
-                                        point1 = gpu_points1_pd.iloc[i]
-                                        idx1 = seg1_indices[i]
-                                        
-                                        for j in range(j_start, j_end):
-                                            point2 = gpu_points2_pd.iloc[j]
-                                            idx2 = seg2_indices[j]
-                                            
-                                            # Use Shapely's distance
-                                            if point1.distance(point2) <= point_distance_threshold:
-                                                all_adjacency_pairs.add((idx1, idx2))
-                                                all_adjacency_pairs.add((idx2, idx1))
-                        
-                        except Exception as e:
-                            self.logger.warning(f"GPU distance calculation failed: {e}")
-                            self.logger.warning("Falling back to CPU calculation for this segment pair")
-                            
-                            # CPU fallback for this segment pair
-                            for i, (idx1, geom1) in enumerate(segment_points):
-                                for j, (idx2, geom2) in enumerate(adj_segment_points):
-                                    if geom1.distance(geom2) <= point_distance_threshold:
-                                        all_adjacency_pairs.add((idx1, idx2))
-                                        all_adjacency_pairs.add((idx2, idx1))
-                
-                # Log progress
-                progress = min(100, int((batch_end / total_pairs) * 100))
-                self.logger.info(f"Processing: {progress}% complete ({batch_end}/{total_pairs} pairs)")
-                        
-            # Convert set to list and build adjacency dictionary
-            self.logger.info(f"Building final adjacency structure from {len(all_adjacency_pairs)//2} unique point pairs")
-            point_adjacency = {idx: [] for idx in points_df.index}
-            
-            for point1, point2 in all_adjacency_pairs:
-                if point2 not in point_adjacency[point1]:
-                    point_adjacency[point1].append(point2)
-            
-            # After processing cross-segment adjacencies, add within-segment adjacencies
-            self.logger.info("Adding within-segment adjacency relationships")
-            
-            # Group points by segment ID
-            segment_point_groups = points_df.groupby('level_0')
-            
-            # Process each segment
-            for segment_id, group in segment_point_groups:
-                points = group[geometry_column].tolist()
-                indices = group.index.tolist()
-                
-                # For smaller segments, use a direct approach
-                for i in range(len(points)):
-                    for j in range(i + 1, len(points)):
-                        if points[i].distance(points[j]) <= point_distance_threshold:
-                            idx1 = indices[i]
-                            idx2 = indices[j]
-                            
-                            # Add bidirectional adjacency
-                            if idx2 not in point_adjacency[idx1]:
-                                point_adjacency[idx1].append(idx2)
-                            if idx1 not in point_adjacency[idx2]:
-                                point_adjacency[idx2].append(idx1)
-            
-            # Add adjacency information to the points dataframe
-            self.logger.info("Adding adjacency information to points dataframe")
-            points_df['point_adjacent_ids'] = points_df.index.map(point_adjacency)
-            points_df['point_adjacency_count'] = points_df['point_adjacent_ids'].apply(len)
-            
-            # Log adjacency statistics
-            avg_adjacency = points_df['point_adjacency_count'].mean()
-            max_adjacency = points_df['point_adjacency_count'].max()
-            isolated_count = (points_df['point_adjacency_count'] == 0).sum()
-            
-            self.logger.info(f"Point adjacency statistics:")
-            self.logger.info(f"  - Average adjacent points per point: {avg_adjacency:.2f}")
-            self.logger.info(f"  - Maximum adjacent points: {max_adjacency}")
-            self.logger.info(f"  - Isolated points: {isolated_count} ({isolated_count/len(points_df)*100:.1f}%)")
-            
-            return points_df
-            
-        except Exception as e:
-            self.logger.error(f"Error in compute_point_adjacency_gpu: {e}")
-            self.logger.error(f"Error details: {str(e)}")
-            # Fall back to parallel CPU implementation
-            self.logger.info("Falling back to CPU implementation")
-            return self.compute_point_adjacency_parallel(segmentized_points, source_gdf, point_distance_threshold)
+        # Delegate to GPU implementation
+        return self._gpu_implementations.compute_point_adjacency(
+            segmentized_points, 
+            source_gdf,
+            point_distance_threshold=point_distance_threshold,
+            batch_size=batch_size
+        )
 
-    def compute_point_adjacency_parallel(self, segmentized_points, source_gdf, point_distance_threshold=10, n_jobs=None):
+    #-------------- PROCESSING PIPELINE STEPS ---------------#
+    
+    def setup_processing(self, ctx: ProcessingContext) -> ProcessingContext:
         """
-        Compute adjacency between segmentized points based on original segment adjacency
-        with parallel processing for maximum performance
+        Set up processing parameters and log them
+        
+        First step in the processing pipeline that validates input parameters,
+        calculates defaults, and prepares for processing.
+        """
+        self.logger.info(f"Processing parameters:")
+        self.logger.info(f"  - Input path: {ctx.input_path}")
+        self.logger.info(f"  - Segmentation distance: {ctx.segmentation_distance} feet")
+        
+        # Calculate intelligent default for point_distance_threshold if not specified
+        if ctx.point_distance_threshold is None:
+            # Use 1.01x the segmentation distance as the default threshold
+            ctx.point_distance_threshold = 1.05 * ctx.segmentation_distance
+            self.logger.info(f"  - Using auto-calculated point distance threshold: {ctx.point_distance_threshold:.2f} feet (1.01 × segmentation distance)")
+        else:
+            self.logger.info(f"  - Using manual point distance threshold: {ctx.point_distance_threshold} feet")
+        
+        # Set default output path if not provided
+        if ctx.output_path is None:
+            input_dir = os.path.dirname(str(ctx.input_path))
+            input_basename = os.path.basename(str(ctx.input_path)).split('.')[0]
+            ctx.output_path = os.path.join(input_dir, f"{input_basename}_segmentized.parquet")
+            self.logger.info(f"Using default output path: {ctx.output_path}")
+        else:
+            self.logger.info(f"Output path: {ctx.output_path}")
+        
+        self.logger.info("Starting sidewalk segmentization process")
+        ctx.start_time = pd.Timestamp.now()
+        return ctx
+    
+    def load_sidewalk_data(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Load sidewalk data from input path
+        
+        Loads the sidewalk geometries from the specified file and ensures
+        they're in the correct coordinate system.
+        """
+        use_sidewalk_widths = "sidewalkwidths" in str(ctx.input_path).lower()
+        self.logger.info(f"Data source identified as: {'sidewalk widths' if use_sidewalk_widths else 'standard sidewalks'}")
+        
+        ctx.sidewalks_data = self.read_geodataframe(
+            ctx.input_path, 
+            crs=PROJ_FT, 
+            name="sidewalk data"
+        )
+        
+        if ctx.sidewalks_data is None:
+            self.logger.error("Failed to load input data")
+            return None
+            
+        return ctx
+    
+    def simplify_sidewalk_geometries(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Simplify sidewalk geometries to improve processing efficiency
+        
+        Reduces the complexity of sidewalk geometries by removing redundant vertices
+        while preserving their essential shape.
+        """
+        if ctx.sidewalks_data is None:
+            self.logger.error("No sidewalk data available to simplify")
+            return None
+            
+        self.logger.info("Simplifying geometries")
+        ctx.sidewalks_data = self.simplify_geometries(ctx.sidewalks_data, tolerance=10)
+        
+        if ctx.sidewalks_data is None:
+            self.logger.error("Failed to simplify geometries")
+            return None
+            
+        return ctx
+    
+    def calculate_segment_adjacency(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Calculate adjacency relationships between sidewalk segments
+        
+        Determines which sidewalk segments are adjacent to each other. This information
+        is later used to establish connectivity between points derived from different
+        segments.
+        """
+        if ctx.sidewalks_data is None:
+            self.logger.error("No sidewalk data available to calculate adjacency")
+            return None
+            
+        if ctx.compute_adj:
+            self.logger.info("Computing segment-level adjacency relationships")
+            ctx.sidewalks_data = self.compute_segment_adjacency(ctx.sidewalks_data, tolerance=ctx.adj_tolerance)
+            
+            if ctx.sidewalks_data is None:
+                self.logger.error("Failed to compute segment adjacency")
+                return None
+                
+        return ctx
+    
+    def segmentize_sidewalks(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Convert sidewalk geometries into regularly spaced points
+        
+        Transforms the sidewalk line or polygon geometries into a series of points
+        spaced at regular intervals (defined by segmentation_distance).
+        """
+        if ctx.sidewalks_data is None:
+            self.logger.error("No sidewalk data available to segmentize")
+            return None
+            
+        ctx.segmentized_points = self.convert_segments_to_points(
+            ctx.sidewalks_data, 
+            distance=ctx.segmentation_distance
+        )
+        
+        if ctx.segmentized_points is None:
+            self.logger.error("Failed to segmentize data")
+            return None
+            
+        self.logger.info(f"Segmentized into {len(ctx.segmentized_points)} points")
+        return ctx
+    
+    def merge_corner_points(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Consolidate closely spaced points at corners and intersections
+        
+        Merges points that are too close together to avoid redundancy in the network
+        and create better topology at intersections.
+        """
+        if ctx.segmentized_points is None:
+            self.logger.error("No segmentized points available to merge corners")
+            return None
+            
+        # FIX: First ensure we have a proper GeoDataFrame before any geometry operations
+        if not isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
+            self.logger.warning("Converting result to GeoDataFrame before consolidation")
+            try:
+                # Check if it's a GeoSeries (common case after segmentization)
+                if isinstance(ctx.segmentized_points, gpd.GeoSeries):
+                    self.logger.info("Converting GeoSeries to GeoDataFrame")
+                    ctx.segmentized_points = gpd.GeoDataFrame(
+                        geometry=ctx.segmentized_points,
+                        crs=ctx.segmentized_points.crs
+                    )
+                else:
+                    # Try to find possible geometry column in a regular DataFrame
+                    points_df = ctx.segmentized_points
+                    geometry_col = None
+                    
+                    # Try to find a column with Point objects
+                    if 0 in points_df.columns and isinstance(points_df[0].iloc[0], Point):
+                        geometry_col = 0
+                    else:
+                        # Check other columns
+                        for col in points_df.columns:
+                            if isinstance(points_df[col].iloc[0], Point):
+                                geometry_col = col
+                                break
+                                
+                    if geometry_col is not None:
+                        self.logger.info(f"Using column '{geometry_col}' as geometry")
+                        ctx.segmentized_points = gpd.GeoDataFrame(
+                            points_df, 
+                            geometry=geometry_col,
+                            crs=PROJ_FT
+                        )
+                    else:
+                        self.logger.error("Could not find geometry column")
+                        return None
+            except Exception as e:
+                self.logger.error(f"Failed to convert to GeoDataFrame: {e}")
+                return None
+
+        # Now consolidate points to avoid duplication at corners
+        if ctx.segmentation_distance is not None:
+            consolidation_distance = ctx.segmentation_distance * 0.3
+            self.logger.info(f"Consolidating closely clustered points (threshold: {consolidation_distance}ft)")
+            ctx.segmentized_points = self.merge_nearby_corner_points(
+                ctx.segmentized_points, 
+                min_distance=consolidation_distance
+            )
+            
+            if ctx.segmentized_points is None:
+                self.logger.error("Failed to consolidate corner points")
+                return None
+                
+        return ctx
+    
+    def filter_points_to_sidewalks(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Filter points to ensure they fall within actual sidewalk areas
+        
+        Uses the original sidewalk polygons to validate that all points
+        created during segmentization fall within legitimate sidewalk areas.
+        """
+        if ctx.segmentized_points is None:
+            self.logger.error("No segmentized points available to filter")
+            return None
+            
+        # Save the original geometry column name and check for actual Point objects
+        orig_geom_col = ctx.segmentized_points.geometry.name if isinstance(ctx.segmentized_points, gpd.GeoDataFrame) else None
+        
+        # Log information about input data structure for debugging
+        if isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
+            self.logger.info(f"Input to filter is a GeoDataFrame with geometry column '{ctx.segmentized_points.geometry.name}'")
+            self.logger.info(f"Available columns: {ctx.segmentized_points.columns.tolist()}")
+        else:
+            self.logger.info(f"Input to filter is not a GeoDataFrame: {type(ctx.segmentized_points)}")
+        
+        # Apply the filtering operation
+        ctx.segmentized_points = self.filter_points_with_sidewalk_network(
+            ctx.segmentized_points, 
+            f"{INSTALL_DIR}/data/nyc/_raw/Sidewalk.geojson"
+        )
+        
+        if ctx.segmentized_points is None:
+            self.logger.error("Failed to filter points")
+            return None
+            
+        # Log filtered data structure for debugging
+        self.logger.info(f"Filtered result type: {type(ctx.segmentized_points)}")
+        self.logger.info(f"Filtered result columns: {ctx.segmentized_points.columns.tolist()}")
+        
+        # Ensure geometry column is properly set after filtering
+        if isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
+            # Check if geometry column is properly set
+            if ctx.segmentized_points.geometry.name is None or ctx.segmentized_points.geometry.name not in ctx.segmentized_points.columns:
+                self.logger.warning("Geometry column lost during filtering, attempting to restore...")
+                try:
+                    # Try to restore original geometry column
+                    if orig_geom_col and orig_geom_col in ctx.segmentized_points.columns:
+                        self.logger.info(f"Restoring original geometry column '{orig_geom_col}'")
+                        ctx.segmentized_points = gpd.GeoDataFrame(
+                            ctx.segmentized_points,
+                            geometry=orig_geom_col,
+                            crs=PROJ_FT
+                        )
+                    elif 'geometry' in ctx.segmentized_points.columns:
+                        self.logger.info("Using 'geometry' column as geometry")
+                        ctx.segmentized_points = gpd.GeoDataFrame(
+                            ctx.segmentized_points,
+                            geometry='geometry',
+                            crs=PROJ_FT
+                        )
+                    else:
+                        # Try to find any column with Point objects as a last resort
+                        for col in ctx.segmentized_points.columns:
+                            if len(ctx.segmentized_points) > 0 and isinstance(ctx.segmentized_points[col].iloc[0], Point):
+                                self.logger.info(f"Found column '{col}' containing Point objects, using as geometry")
+                                ctx.segmentized_points = gpd.GeoDataFrame(
+                                    ctx.segmentized_points,
+                                    geometry=col,
+                                    crs=PROJ_FT
+                                )
+                                break
+                        else:
+                            self.logger.warning("Could not restore geometry column automatically")
+                except Exception as e:
+                    self.logger.error(f"Failed to restore geometry column: {e}")
+                    # Continue anyway, we'll try again in the next step
+        else:
+            self.logger.warning("Filter result is not a GeoDataFrame, attempting to convert")
+            try:
+                # Check if it's a pandas DataFrame with a 'geometry' column
+                if hasattr(ctx.segmentized_points, 'columns') and 'geometry' in ctx.segmentized_points.columns:
+                    self.logger.info("Converting DataFrame with 'geometry' column to GeoDataFrame")
+                    ctx.segmentized_points = gpd.GeoDataFrame(
+                        ctx.segmentized_points, 
+                        geometry='geometry',
+                        crs=PROJ_FT
+                    )
+                # Check if it's a pandas DataFrame with any column containing Point objects
+                elif hasattr(ctx.segmentized_points, 'columns'):
+                    for col in ctx.segmentized_points.columns:
+                        if len(ctx.segmentized_points) > 0 and isinstance(ctx.segmentized_points[col].iloc[0], Point):
+                            self.logger.info(f"Found column '{col}' with Point objects, using as geometry")
+                            ctx.segmentized_points = gpd.GeoDataFrame(
+                                ctx.segmentized_points,
+                                geometry=col,
+                                crs=PROJ_FT
+                            )
+                            break
+                    else:
+                        self.logger.error("Could not find any column with Point objects")
+                        return None
+                else:
+                    self.logger.error("Filter result is not a DataFrame and could not be converted")
+                    return None
+            except Exception as e:
+                self.logger.error(f"Failed to convert filter result to GeoDataFrame: {e}")
+                return None
+                
+        # Final verification
+        if not isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
+            self.logger.error("Failed to ensure result is a GeoDataFrame after filtering")
+            return None
+            
+        self.logger.info(f"Final filtered result: GeoDataFrame with {len(ctx.segmentized_points)} points, " +
+                        f"geometry column '{ctx.segmentized_points.geometry.name}'")
+        
+        return ctx
+    
+    def establish_point_adjacency(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Establish adjacency relationships between individual points
+        """
+        if ctx.segmentized_points is None:
+            self.logger.error("No segmentized points available to establish adjacency")
+            return None
+            
+        if ctx.sidewalks_data is None:
+            self.logger.error("No sidewalk data available for adjacency computation")
+            return None
+            
+        # Fix: Ensure geometry column is properly set before adjacency computation
+        if not isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
+            self.logger.error("Segmentized points is not a GeoDataFrame")
+            return None
+        
+        # Check if geometry column is properly set
+        if ctx.segmentized_points.geometry.name is None or ctx.segmentized_points.geometry.name not in ctx.segmentized_points.columns:
+            self.logger.warning("Geometry column not properly set, attempting to fix...")
+            try:
+                # Try to identify the geometry column
+                if 'geometry' in ctx.segmentized_points.columns:
+                    self.logger.info("Using 'geometry' column as geometry")
+                    ctx.segmentized_points = gpd.GeoDataFrame(
+                        ctx.segmentized_points,
+                        geometry='geometry',
+                        crs=PROJ_FT
+                    )
+                else:
+                    # Try to find a column with Point objects
+                    for col in ctx.segmentized_points.columns:
+                        if isinstance(ctx.segmentized_points[col].iloc[0], Point):
+                            self.logger.info(f"Using column '{col}' as geometry")
+                            ctx.segmentized_points = gpd.GeoDataFrame(
+                                ctx.segmentized_points,
+                                geometry=col,
+                                crs=PROJ_FT
+                            )
+                            break
+                    else:
+                        self.logger.error("Could not find geometry column")
+                        return None
+            except Exception as e:
+                self.logger.error(f"Failed to fix geometry column: {e}")
+                return None
+                
+        if ctx.compute_adj and ctx.point_adjacency:
+            self.logger.info("Computing point-level adjacency relationships")
+            ctx.segmentized_points = self.compute_point_level_adjacency(
+                ctx.segmentized_points, 
+                ctx.sidewalks_data,
+                point_distance_threshold=ctx.point_distance_threshold
+            )
+            
+            if ctx.segmentized_points is None:
+                self.logger.error("Failed to compute point adjacency")
+                return None
+                    
+        return ctx
+    
+    def prepare_final_data(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Prepare the final dataframe with attributes from original segments
+        
+        Creates the final point network by attaching attributes from the original
+        sidewalk segments to their corresponding points.
+        """
+        if ctx.segmentized_points is None:
+            self.logger.error("No segmentized points available to prepare final data")
+            return None
+            
+        if ctx.sidewalks_data is None:
+            self.logger.error("No sidewalk data available for attribute transfer")
+            return None
+            
+        ctx.result = self.prepare_final_dataframe(ctx.segmentized_points, ctx.sidewalks_data)
+        
+        if ctx.result is None:
+            self.logger.error("Failed to prepare final dataframe")
+            return None
+            
+        # Ensure result is in the correct CRS
+        self.logger.info(f"Ensuring output is in {PROJ_FT}")
+        prev_crs = ctx.result.crs
+        ctx.result = self.ensure_crs(ctx.result, PROJ_FT)
+        
+        if ctx.result is None:
+            self.logger.error("Failed to ensure correct CRS")
+            return None
+            
+        if prev_crs != PROJ_FT:
+            self.logger.info(f"CRS transformed from {prev_crs} to {PROJ_FT}")
+            bounds = ctx.result.total_bounds
+            self.logger.info(f"Output bounds [minx, miny, maxx, maxy]: {bounds}")
+            
+        return ctx
+    
+    def save_output_data(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Save the final point network to output file
+        
+        Writes the processed point network with all attributes and adjacency
+        information to disk in the specified format.
+        """
+        if ctx.result is None:
+            self.logger.error("No result data available to save")
+            return None
+            
+        if ctx.output_path is None:
+            self.logger.error("No output path specified")
+            return None
+            
+        self.logger.info(f"Saving {len(ctx.result)} segmentized points to {ctx.output_path}")
+        success = self.save_geoparquet(ctx.result, ctx.output_path)
+        
+        if not success:
+            self.logger.error("Failed to save output file")
+            return None
+            
+        ctx.success = True
+        return ctx
+    
+    def report_statistics(self, ctx: ProcessingContext) -> ProcessingContext:
+        """
+        Report final statistics about the processing results
+        
+        Calculates and logs performance metrics, data transformation statistics,
+        and other useful information about the completed process.
+        """
+        if ctx.result is None or ctx.sidewalks_data is None or ctx.start_time is None:
+            self.logger.warning("Incomplete context data, skipping detailed statistics")
+            return ctx
+            
+        end_time = pd.Timestamp.now()
+        elapsed_time = (end_time - ctx.start_time).total_seconds()
+        points_per_second = len(ctx.result) / elapsed_time if elapsed_time > 0 else 0
+        
+        self.logger.info(f"Processing statistics:")
+        self.logger.info(f"  - Input features: {len(ctx.sidewalks_data)}")
+        self.logger.info(f"  - Output points: {len(ctx.result)}")
+        self.logger.info(f"  - Points-to-feature ratio: {len(ctx.result)/len(ctx.sidewalks_data):.1f}")
+        self.logger.info(f"  - Processing time: {elapsed_time:.1f} seconds")
+        self.logger.info(f"  - Processing speed: {points_per_second:.1f} points/second")
+        
+        # Add network statistics if adjacency was computed
+        if 'point_adjacent_ids' in ctx.result.columns:
+            avg_connections = ctx.result['point_adjacent_ids'].apply(len).mean()
+            max_connections = ctx.result['point_adjacent_ids'].apply(len).max()
+            isolated_points = (ctx.result['point_adjacent_ids'].apply(len) == 0).sum()
+            
+            self.logger.info(f"  - Network statistics:")
+            self.logger.info(f"    - Average connections per point: {avg_connections:.2f}")
+            self.logger.info(f"    - Maximum connections for a point: {max_connections}")
+            self.logger.info(f"    - Isolated points: {isolated_points} ({isolated_points/len(ctx.result)*100:.1f}%)")
+        
+        self.logger.success("Sidewalk segmentization completed successfully")
+        return ctx
+    
+    def execute_processing_pipeline(self, ctx: ProcessingContext) -> bool:
+        """
+        Execute the complete processing pipeline with error handling
+        
+        This is the main orchestrator method that runs each step in the
+        processing pipeline in sequence, with proper error handling.
         
         Parameters:
         -----------
-        segmentized_points : GeoDataFrame
-            The segmentized points with level_0 indicating the parent segment
-        source_gdf : GeoDataFrame
-            The original segments with adjacent_ids column from previous computation
-        point_distance_threshold : float
-            Maximum distance between points to be considered adjacent (in feet)
-        n_jobs : int, optional
-            Number of parallel jobs to run. If None, uses CPU count - 1
+        ctx : ProcessingContext
+            Processing context with input parameters and state
             
         Returns:
         --------
-        GeoDataFrame
-            Points with point-level adjacency information
+        bool
+            True if processing was successful, False otherwise
         """
-        try:
-            if 'adjacent_ids' not in source_gdf.columns:
-                self.logger.warning("No adjacency information found in source data, skipping point adjacency")
-                return segmentized_points
+        # Define the processing pipeline steps in order
+        pipeline_steps: List[Tuple[Callable[[ProcessingContext], Optional[ProcessingContext]], str]] = [
+            (self.setup_processing, "Setting up processing parameters"),
+            (self.load_sidewalk_data, "Loading sidewalk data"),
+            (self.simplify_sidewalk_geometries, "Simplifying geometries"),
+            (self.calculate_segment_adjacency, "Calculating segment adjacency"),
+            (self.segmentize_sidewalks, "Converting sidewalks to points"),
+            (self.merge_corner_points, "Merging corner points"),
+            (self.filter_points_to_sidewalks, "Filtering points to sidewalk areas"),
+            (self.establish_point_adjacency, "Establishing point adjacency network"),
+            (self.prepare_final_data, "Preparing final data structure"),
+            (self.save_output_data, "Saving output data"),
+            (self.report_statistics, "Reporting statistics")
+        ]
+        
+        # Execute each step in sequence
+        for step_func, step_description in pipeline_steps:
+            self.logger.info(f"STEP: {step_description}")
+            step_start = pd.Timestamp.now()
+            
+            # Execute the step
+            ctx = step_func(ctx)
+            
+            # Calculate step duration
+            step_duration = (pd.Timestamp.now() - step_start).total_seconds()
+            
+            # Check for failure
+            if ctx is None:
+                self.logger.error(f"Pipeline failed during: {step_description} after {step_duration:.2f} seconds")
+                return False
                 
-            self.logger.info("Computing point-level adjacency relationships with parallel processing")
-            self.logger.info(f"Using point distance threshold of {point_distance_threshold} feet")
-            
-            # Reset index to get segment ID as level_0 column
-            points_df = gpd.GeoDataFrame(segmentized_points).reset_index()
-            
-            # Set the active geometry column explicitly
-            if 0 in points_df.columns:
-                points_df = points_df.set_geometry(0)
-                geometry_column = 0  
-            else:
-                self.logger.error("Could not find geometry column in segmentized points")
-                return segmentized_points
-            
-            # Create a numpy array of geometries for faster access
-            self.logger.info("Creating optimized data structures")
-            point_geometries = np.array(points_df[geometry_column].tolist())
-            point_segment_ids = np.array(points_df['level_0'].tolist())
-            
-            # Group points by segment for faster access
-            segment_to_point_indices = {}
-            for i, segment_id in enumerate(point_segment_ids):
-                if segment_id not in segment_to_point_indices:
-                    segment_to_point_indices[segment_id] = []
-                segment_to_point_indices[segment_id].append(i)
-            
-            # Create STRtree for even faster spatial queries (better than geopandas sindex)
-            self.logger.info("Building STRtree for optimal spatial indexing")
-            point_index = STRtree(point_geometries)
-            
-            # Get all segment pairs that need processing
-            segment_pairs = []
-            for segment_id in source_gdf.index:
-                if segment_id not in segment_to_point_indices:
-                    continue
-                    
-                adjacent_segment_ids = source_gdf.loc[segment_id, 'adjacent_ids']
-                if not adjacent_segment_ids:
-                    continue
-                    
-                for adj_segment_id in adjacent_segment_ids:
-                    if adj_segment_id in segment_to_point_indices:
-                        # Only process each pair once (i,j) where i < j to avoid duplicates
-                        if segment_id < adj_segment_id:
-                            segment_pairs.append((segment_id, adj_segment_id))
-            
-            self.logger.info(f"Found {len(segment_pairs)} segment pairs to process")
-            
-            # Define worker function for parallel processing
-            def process_segment_pair(pair_data):
-                segment_id, adj_segment_id = pair_data
-                adjacency_results = []
+            self.logger.info(f"Completed in {step_duration:.2f} seconds")
                 
-                # Get indices of points in both segments
-                segment_point_indices = segment_to_point_indices[segment_id]
-                adj_segment_point_indices = segment_to_point_indices[adj_segment_id]
-                
-                # For each point in first segment
-                for i in segment_point_indices:
-                    point_geom = point_geometries[i]
-                    point_idx = points_df.index[i]
-                    
-                    # Use spatial index to find nearby points from adjacent segment
-                    # This is much faster than checking all point pairs
-                    buffer_bounds = point_geom.buffer(point_distance_threshold).bounds
-                    candidate_indices = list(point_index.query(point_geom.buffer(point_distance_threshold)))
-                    
-                    # Filter candidates to only those from adjacent segment
-                    for j in candidate_indices:
-                        if j in adj_segment_point_indices:
-                            adj_point_geom = point_geometries[j]
-                            adj_point_idx = points_df.index[j]
-                            
-                            # Check distance
-                            if point_geom.distance(adj_point_geom) <= point_distance_threshold:
-                                adjacency_results.append((point_idx, adj_point_idx))
-                
-                return adjacency_results
-            
-            # Use multiprocessing for parallelization
-            if n_jobs is None:
-                n_jobs = max(1, multiprocessing.cpu_count() - 1)
-                
-            self.logger.info(f"Processing segment pairs in parallel using {n_jobs} processes")
-            
-            # Split work into chunks for better parallel performance
-            chunk_size = max(1, len(segment_pairs) // (n_jobs * 10))  # Aim for ~10 chunks per job
-            
-            # Create pool and process chunks in parallel
-            with multiprocessing.Pool(processes=n_jobs) as pool:
-                all_results = []
-                # Process in chunks with progress tracking
-                for chunk_start in range(0, len(segment_pairs), chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, len(segment_pairs))
-                    chunk = segment_pairs[chunk_start:chunk_end]
-                    
-                    # Process the chunk
-                    chunk_results = pool.map(process_segment_pair, chunk)
-                    
-                    # Flatten results
-                    for result in chunk_results:
-                        all_results.extend(result)
-                        
-                    # Log progress
-                    progress = min(100, int((chunk_end / len(segment_pairs)) * 100))
-                    self.logger.info(f"Progress: {progress}% ({chunk_end}/{len(segment_pairs)} pairs)")
-            
-            # Build adjacency dictionary from results
-            self.logger.info(f"Building final adjacency structure from {len(all_results)} point pairs")
-            point_adjacency = {idx: [] for idx in points_df.index}
-            
-            for point1, point2 in all_results:
-                point_adjacency[point1].append(point2)
-                point_adjacency[point2].append(point1)  # Add bidirectional adjacency
-            
-            # Add adjacency information to the points dataframe
-            self.logger.info("Adding adjacency information to points dataframe")
-            points_df['point_adjacent_ids'] = points_df.index.map(point_adjacency)
-            points_df['point_adjacency_count'] = points_df['point_adjacent_ids'].apply(len)
-            
-            # Log adjacency statistics
-            avg_adjacency = points_df['point_adjacency_count'].mean()
-            max_adjacency = points_df['point_adjacency_count'].max()
-            isolated_count = (points_df['point_adjacency_count'] == 0).sum()
-            
-            self.logger.info(f"Point adjacency statistics:")
-            self.logger.info(f"  - Average adjacent points per point: {avg_adjacency:.2f}")
-            self.logger.info(f"  - Maximum adjacent points: {max_adjacency}")
-            self.logger.info(f"  - Isolated points: {isolated_count} ({isolated_count/len(points_df)*100:.1f}%)")
-            
-            return points_df
-            
-        except Exception as e:
-            self.logger.error(f"Error in compute_point_adjacency_parallel: {e}")
-            self.logger.error(f"Error details: {str(e)}")
-            return segmentized_points
-
-    def process(self, i, o=None, nta_path=None, neighborhood=None, 
-               segmentation_distance=50, compute_adj=True, adj_tolerance=0.1,
-               point_adjacency=True, point_distance_threshold=None):
+        return ctx.success
+    
+    def process(self, i: PathLike, o: Optional[PathLike] = None,
+               segmentation_distance: float = 50, compute_adj: bool = True, adj_tolerance: float = 0.1,
+               point_adjacency: bool = True, point_distance_threshold: Optional[float] = None) -> bool:
         """
         Process sidewalk data to segmentize into points
+        
+        Main entry point for command-line processing. Takes sidewalk geometries and
+        converts them into a network of regularly spaced points with adjacency relationships.
         
         Args:
             i: Path to input sidewalk data
             o: Path to save output data (default: derived from input path)
-            nta_path: Path to neighborhood data (optional)
-            neighborhood: Name of neighborhood to focus on (optional)
             segmentation_distance: Distance between points in segmentation, feet (default: 50)
             compute_adj: Whether to compute adjacency relationships (default: True)
             adj_tolerance: Distance tolerance for considering geometries adjacent (default: 0.1 feet)
@@ -966,144 +822,163 @@ class SidewalkSegmentizer(GeoDataProcessor):
             bool: True if successful, False otherwise
         """
         try:
-            # Log processing parameters
-            self.logger.info(f"Processing parameters:")
-            self.logger.info(f"  - Input path: {i}")
-            self.logger.info(f"  - Neighborhood filter: {'Yes, ' + neighborhood if neighborhood else 'No'}")
-            self.logger.info(f"  - Segmentation distance: {segmentation_distance} feet")
-            
-            # Calculate intelligent default for point_distance_threshold if not specified
-            if point_distance_threshold is None:
-                # Use 1.2x the segmentation distance as the default threshold
-                point_distance_threshold = 1.01 * segmentation_distance
-                self.logger.info(f"  - Using auto-calculated point distance threshold: {point_distance_threshold:.2f} feet (1.01 × segmentation distance)")
-            else:
-                self.logger.info(f"  - Using manual point distance threshold: {point_distance_threshold} feet")
-            
-            # Set default output path if not provided
-            if o is None:
-                input_dir = os.path.dirname(i)
-                input_basename = os.path.basename(i).split('.')[0]
-                o = os.path.join(input_dir, f"{input_basename}_segmentized.parquet")
-                self.logger.info(f"Using default output path: {o}")
-            else:
-                self.logger.info(f"Output path: {o}")
-            
-            self.logger.info("Starting sidewalk segmentization process")
-            start_time = pd.Timestamp.now()
-            
-            # Load sidewalk data
-            use_sidewalk_widths = "sidewalkwidths" in i.lower()
-            self.logger.info(f"Data source identified as: {'sidewalk widths' if use_sidewalk_widths else 'standard sidewalks'}")
-            sidewalks = self.read_geodataframe(
-                i, 
-                crs=PROJ_FT if use_sidewalk_widths else None, 
-                name="sidewalk data"
+            # Create context object with all parameters
+            ctx = ProcessingContext(
+                input_path=i,
+                output_path=o,
+                segmentation_distance=segmentation_distance,
+                adj_tolerance=adj_tolerance,
+                compute_adj=compute_adj,
+                point_adjacency=point_adjacency,
+                point_distance_threshold=point_distance_threshold
             )
             
-            if sidewalks is None:
-                return False
-            
-            # Load neighborhood data and crop if requested
-            if nta_path and neighborhood:
-                # Load neighborhood boundaries
-                nta_gdf = self.read_geodataframe(nta_path, crs=PROJ_FT, name="neighborhood data")
-                
-                if nta_gdf is None:
-                    self.logger.warning("Could not load neighborhood data, proceeding with full dataset")
-                else:
-                    # Crop to neighborhood of interest
-                    cropped_sidewalks = self.clip_to_neighborhood(sidewalks, nta_gdf, neighborhood)
-                    
-                    if cropped_sidewalks is None:
-                        self.logger.warning("Could not crop to neighborhood, proceeding with full dataset")
-                    else:
-                        self.logger.info(f"Working with {len(cropped_sidewalks)} features in {neighborhood}")
-                        sidewalks = cropped_sidewalks
-            
-            # Simplify geometries if not using sidewalk widths (which are already simplified)
-            if not use_sidewalk_widths:
-                self.logger.info("Simplifying geometries")
-                sidewalks = self.simplify_geometries(sidewalks, tolerance=10)
-                if sidewalks is None:
-                    return False
-            
-            # Compute adjacency relationships if requested
-            if compute_adj:
-                self.logger.info("Computing segment-level adjacency relationships")
-                sidewalks = self.compute_adjacency(sidewalks, tolerance=adj_tolerance)
-                if sidewalks is None:
-                    return False
-            
-            # Segmentize and extract points
-            segmentized = self.segmentize_and_extract_points(sidewalks, distance=segmentation_distance)
-            if segmentized is None:
-                return False
-            self.logger.info(f"Segmentized into {len(segmentized)} points")
-
-            # cleanup 
-            segmentized = self.cleanup(segmentized, "../../data/nyc/_raw/Sidewalk.geojson")
-                
-            # Compute point-level adjacency if requested and segment adjacency was computed
-            if compute_adj and point_adjacency:
-                self.logger.info("Computing point-level adjacency relationships")
-                segmentized = self.compute_point_adjacency(
-                    segmentized, 
-                    sidewalks,
-                    point_distance_threshold=point_distance_threshold
-                )
-                
-            # Prepare final dataframe with attributes
-            result = self.prepare_segmentized_dataframe(segmentized, sidewalks)
-            if result is None:
-                return False
-            
-            # Ensure result is in the correct CRS
-            self.logger.info(f"Ensuring output is in {PROJ_FT}")
-            prev_crs = result.crs
-            result = self.ensure_crs(result, PROJ_FT)
-            if result is None:
-                return False
-                
-            if prev_crs != PROJ_FT:
-                self.logger.info(f"CRS transformed from {prev_crs} to {PROJ_FT}")
-                bounds = result.total_bounds
-                self.logger.info(f"Output bounds [minx, miny, maxx, maxy]: {bounds}")
-            
-            # Save output
-            self.logger.info(f"Saving {len(result)} segmentized points to {o}")
-            success = self.save_geoparquet(result, o)
-            if not success:
-                return False
-            
-            # Final stats and summary
-            end_time = pd.Timestamp.now()
-            elapsed_time = (end_time - start_time).total_seconds()
-            points_per_second = len(result) / elapsed_time if elapsed_time > 0 else 0
-            
-            self.logger.info(f"Processing statistics:")
-            self.logger.info(f"  - Input features: {len(sidewalks)}")
-            self.logger.info(f"  - Output points: {len(result)}")
-            self.logger.info(f"  - Points-to-feature ratio: {len(result)/len(sidewalks):.1f}")
-            self.logger.info(f"  - Processing time: {elapsed_time:.1f} seconds")
-            self.logger.info(f"  - Processing speed: {points_per_second:.1f} points/second")
-            
-            self.logger.success("Sidewalk segmentization completed successfully")
-            return True
+            # Run the processing pipeline
+            return self.execute_processing_pipeline(ctx)
             
         except Exception as e:
             self.logger.error(f"Unhandled exception in process method: {e}")
             return False
-
+            
+    # Alternative fluent interface implementation
+    def with_input(self, input_path: PathLike) -> 'SidewalkSegmentizer':
+        """
+        Start a fluent processing chain with an input file
+        
+        First method in the fluent interface chain that specifies the input data source.
+        
+        Parameters:
+        -----------
+        input_path : str or Path
+            Path to the input sidewalk data file
+            
+        Returns:
+        --------
+        SidewalkSegmentizer
+            Self reference for method chaining
+        """
+        ctx = ProcessingContext(input_path=input_path)
+        self._current_ctx = ctx
+        return self
+        
+    def with_output(self, output_path: PathLike) -> 'SidewalkSegmentizer':
+        """
+        Set output path for the processing chain
+        
+        Specifies where the processed point network should be saved.
+        
+        Parameters:
+        -----------
+        output_path : str or Path
+            Path where output data should be written
+            
+        Returns:
+        --------
+        SidewalkSegmentizer
+            Self reference for method chaining
+        """
+        if self._current_ctx is None:
+            raise ValueError("No processing context. Call with_input() first.")
+        self._current_ctx.output_path = output_path
+        return self
+        
+    def with_segmentation_distance(self, distance: float) -> 'SidewalkSegmentizer':
+        """
+        Set segmentation distance for the processing chain
+        
+        Controls how densely spaced the points will be along sidewalk segments.
+        
+        Parameters:
+        -----------
+        distance : float
+            Distance between points in feet
+            
+        Returns:
+        --------
+        SidewalkSegmentizer
+            Self reference for method chaining
+        """
+        if self._current_ctx is None:
+            raise ValueError("No processing context. Call with_input() first.")
+        self._current_ctx.segmentation_distance = distance
+        return self
+        
+    def with_adjacency(self, compute: bool = True, tolerance: float = 0.1) -> 'SidewalkSegmentizer':
+        """
+        Configure segment adjacency computation for the processing chain
+        
+        Controls whether segment-level adjacency should be computed and the
+        tolerance for determining adjacency.
+        
+        Parameters:
+        -----------
+        compute : bool
+            Whether to compute segment adjacency
+        tolerance : float
+            Distance threshold for considering segments adjacent (feet)
+            
+        Returns:
+        --------
+        SidewalkSegmentizer
+            Self reference for method chaining
+        """
+        if self._current_ctx is None:
+            raise ValueError("No processing context. Call with_input() first.")
+        self._current_ctx.compute_adj = compute
+        self._current_ctx.adj_tolerance = tolerance
+        return self
+        
+    def with_point_adjacency(self, compute: bool = True, threshold: Optional[float] = None) -> 'SidewalkSegmentizer':
+        """
+        Configure point-level adjacency computation for the processing chain
+        
+        Controls whether point-level adjacency should be computed and the
+        distance threshold for determining which points are adjacent.
+        
+        Parameters:
+        -----------
+        compute : bool
+            Whether to compute point adjacency
+        threshold : float, optional
+            Maximum distance between points to be considered adjacent (feet)
+            If None, will use 1.01 * segmentation_distance
+            
+        Returns:
+        --------
+        SidewalkSegmentizer
+            Self reference for method chaining
+        """
+        if self._current_ctx is None:
+            raise ValueError("No processing context. Call with_input() first.")
+        self._current_ctx.point_adjacency = compute
+        self._current_ctx.point_distance_threshold = threshold
+        return self
+        
+    def run(self) -> bool:
+        """
+        Run the processing chain with the configured parameters
+        
+        Final method in the fluent interface chain that executes the
+        processing pipeline with all configured parameters.
+        
+        Returns:
+        --------
+        bool
+            True if processing was successful, False otherwise
+        """
+        try:
+            if self._current_ctx is None:
+                self.logger.error("No processing context configured. Call with_input() first.")
+                return False
+                
+            ctx = self._current_ctx
+            self._current_ctx = None  # Clear for next chain
+            return self.execute_processing_pipeline(ctx)
+        except Exception as e:
+            self.logger.error(f"Unhandled exception in fluent processing chain: {e}")
+            self._current_ctx = None  # Clear for next chain
+            return False
 
 if __name__ == "__main__":
     # Use the Fire CLI library to expose the SidewalkSegmentizer class
     fire.Fire(SidewalkSegmentizer)
-
-# Example command line usage:
-# python segmentize.py process \
-#   --i="../data/sidewalkwidths_nyc.geojson" \
-#   --o="../data/segmentized_nyc_sidewalks.parquet" \
-#   --nta_path="../data/nynta2020_24b/nynta2020.shp" \
-#   --neighborhood="Greenpoint" \
-#   --segmentation_distance=50
