@@ -40,7 +40,7 @@ class ProcessingContext:
     input_path: PathLike
     output_path: Optional[PathLike] = None
     segmentation_distance: float = 50
-    adj_tolerance: float = 0.1
+    adj_tolerance: float = 5
     compute_adj: bool = True
     point_adjacency: bool = True
     point_distance_threshold: Optional[float] = None
@@ -304,7 +304,7 @@ class SidewalkSegmentizer(GeoDataProcessor):
         # Calculate intelligent default for point_distance_threshold if not specified
         if ctx.point_distance_threshold is None:
             # Use 1.01x the segmentation distance as the default threshold
-            ctx.point_distance_threshold = 1.05 * ctx.segmentation_distance
+            ctx.point_distance_threshold = 1.1 * ctx.segmentation_distance
             self.logger.info(f"  - Using auto-calculated point distance threshold: {ctx.point_distance_threshold:.2f} feet (1.01 × segmentation distance)")
         else:
             self.logger.info(f"  - Using manual point distance threshold: {ctx.point_distance_threshold} feet")
@@ -637,6 +637,22 @@ class SidewalkSegmentizer(GeoDataProcessor):
                 return None
                 
         if ctx.compute_adj and ctx.point_adjacency:
+            # Validate segment adjacency data before computing point adjacency
+            if 'adjacent_ids' not in ctx.sidewalks_data.columns:
+                self.logger.warning("No segment adjacency data found, computing it now")
+                ctx.sidewalks_data = self.compute_segment_adjacency(ctx.sidewalks_data, tolerance=ctx.adj_tolerance)
+                if ctx.sidewalks_data is None:
+                    self.logger.error("Failed to compute segment adjacency")
+                    return None
+            
+            # Log segment adjacency statistics for debugging
+            if 'adjacent_ids' in ctx.sidewalks_data.columns:
+                segment_adj_counts = ctx.sidewalks_data['adjacent_ids'].apply(len)
+                avg_segment_adj = segment_adj_counts.mean()
+                max_segment_adj = segment_adj_counts.max()
+                isolated_segments = (segment_adj_counts == 0).sum()
+                self.logger.info(f"Segment adjacency stats: avg={avg_segment_adj:.2f}, max={max_segment_adj}, isolated={isolated_segments}")
+            
             self.logger.info("Computing point-level adjacency relationships")
             ctx.segmentized_points = self.compute_point_level_adjacency(
                 ctx.segmentized_points, 
@@ -647,6 +663,20 @@ class SidewalkSegmentizer(GeoDataProcessor):
             if ctx.segmentized_points is None:
                 self.logger.error("Failed to compute point adjacency")
                 return None
+            
+            # Validate point adjacency results
+            if 'point_adjacent_ids' in ctx.segmentized_points.columns:
+                point_adj_counts = ctx.segmentized_points['point_adjacent_ids'].apply(len)
+                avg_point_adj = point_adj_counts.mean()
+                max_point_adj = point_adj_counts.max()
+                isolated_points = (point_adj_counts == 0).sum()
+                self.logger.info(f"Point adjacency validation: avg={avg_point_adj:.2f}, max={max_point_adj}, isolated={isolated_points}")
+                
+                # Warn if too many points are isolated
+                isolation_rate = isolated_points / len(ctx.segmentized_points)
+                if isolation_rate > 0.1:  # More than 10% isolated
+                    self.logger.warning(f"High isolation rate: {isolation_rate:.1%} of points are isolated")
+                    self.logger.warning("Consider increasing point_distance_threshold or checking segment adjacency")
                     
         return ctx
     

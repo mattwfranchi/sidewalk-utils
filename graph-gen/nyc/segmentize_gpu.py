@@ -199,6 +199,7 @@ class SegmentizeGPUImplementations:
                 
             for adj_segment_id in adjacent_segment_ids:
                 if adj_segment_id in segment_to_points:
+                    # Process both directions to ensure complete adjacency
                     segment_pairs.append((segment_id, adj_segment_id))
         
         self.logger.info(f"Processing {len(segment_pairs)} segment pairs")
@@ -227,8 +228,8 @@ class SegmentizeGPUImplementations:
                 self.logger.info(f"Point adjacency progress: {progress_pct}% ({batch_end}/{total_pairs})")
             
             # Process each segment pair in the batch
-            for i in range(len(batch)):
-                segment_id, adj_segment_id = batch[i]
+            for pair_idx in range(len(batch)):
+                segment_id, adj_segment_id = batch[pair_idx]
                 
                 # Get points from each segment
                 segment_points = segment_to_points.get(segment_id, [])
@@ -259,23 +260,6 @@ class SegmentizeGPUImplementations:
                         # Create GPU-accelerated GeoSeries
                         gpu_points1 = cuspatial.GeoSeries(seg1_points)
                         gpu_points2 = cuspatial.GeoSeries(seg2_points)
-                        
-                        # Vectorized approach for large point collections
-                        if has_vectorized and len(seg1_points) == len(seg2_points):
-                            try:
-                                # Try vectorized distance if points have 1:1 correspondence
-                                distances = cuspatial.pairwise_point_distance(gpu_points1, gpu_points2)
-                                
-                                # Find points within threshold
-                                mask = distances.to_pandas() <= point_distance_threshold
-                                for i in range(len(mask)):
-                                    if mask.iloc[i]:
-                                        all_adjacency_pairs.add((seg1_indices[i], seg2_indices[i]))
-                                        all_adjacency_pairs.add((seg2_indices[i], seg1_indices[i]))
-                                continue
-                            except Exception:
-                                # Fall through to one-by-one approach
-                                pass
                         
                         # Convert to pandas for faster processing
                         gpu_points1_pd = gpu_points1.to_pandas()
