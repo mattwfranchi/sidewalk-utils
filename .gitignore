@@ -180,3 +180,9 @@ cython_debug/
 # add data directory and all nested to gitignore
 data/
 conda/
+
+**/_debug_figs/
+**/detections/
+
+# any and all directories called 'keys'
+**/keys/
