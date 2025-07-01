@@ -1,1 +1,1 @@
-INSTALL_DIR = "/share/ju/sidewalk_utils"
+INSTALL_DIR = "/share/ju/periscopes"

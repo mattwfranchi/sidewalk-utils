@@ -1,8 +1,8 @@
-# sidewalk_utils 
+# deos2ac 
 # @mattwfranchi 
 
 """
-Data input/output module for the sidewalk_utils project.
+Data input/output module for the deos2ac project.
 Provides dataset class and utilities for loading and processing Nexar 2020 dataset.
 """
 from concurrent.futures import ProcessPoolExecutor
@@ -34,7 +34,7 @@ except ImportError:
 
 # ===== Constants =====
 NEXAR_2020 = "/share/pierson/nexar_data/raw_data"
-EXPORT_DIR = "/share/ju/sidewalk_utils/data/raw_export"
+EXPORT_DIR = "/share/ju/deos2ac/data/raw_export"
 
 try:
     import pyarrow

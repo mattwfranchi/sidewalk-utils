@@ -1,8 +1,8 @@
-# sidewalk_utils 
+# deos2ac 
 # @mattwfranchi 
 
 """
-Data input/output module for the sidewalk_utils project.
+Data input/output module for the deos2ac project.
 Provides dataset class and utilities for loading and processing Nexar 2023 dataset.
 """
 from concurrent.futures import ProcessPoolExecutor
@@ -14,9 +14,9 @@ import pandas as pd
 import sys
 import traceback
 
-from utils.logger import get_logger
-from utils.timer import time_it
-from user.base_nexar_dataset import BaseNexarDataset
+from conjectural_inspector.utils.logger import get_logger
+from conjectural_inspector.utils.timer import time_it
+from conjectural_inspector.user.base_nexar_dataset import BaseNexarDataset
 
 # Memory monitoring
 try:
@@ -34,7 +34,7 @@ except ImportError:
 
 # ===== Constants =====
 NEXAR_2023 = "/share/ju/nexar_data/2023"
-EXPORT_DIR = "/share/ju/sidewalk_utils/data/raw_export"
+EXPORT_DIR = "/share/ju/matt/conjectural_inspector/data/dashcam"
 
 try:
     import pyarrow
@@ -132,32 +132,75 @@ class Nexar2023Dataset(BaseNexarDataset):
     def load_images(self, export=False):
         """Load images from the Nexar 2023 dataset.
         
+        The 2023 dataset structure is:
+        /share/ju/nexar_data/2023/
+        ├── 2023-08-22/
+        │   ├── 604222321527357439/  (H3 hexagon ID)
+        │   │   ├── frames/          # Images are in this subdirectory
+        │   │   │   ├── *.jpg (images)
+        │   │   │   └── ...
+        │   │   └── metadata.csv
+        │   └── ...
+        └── ...
+        
         Args:
             export: If True, save the list of image paths to a file in EXPORT_DIR
         """
-        # TODO: Implement proper image loading for 2023 dataset
-        self.logger.warning("Nexar 2023 image loading not fully implemented yet")
+        # Navigate to the 2023 dataset root
+        dataset_root = Path(NEXAR_2023)
+        if not dataset_root.exists():
+            self.logger.error(f"Dataset root not found: {dataset_root}")
+            return []
         
-        # Example implementation pattern (to be replaced with actual code)
-        # image_dirs_path = Path(NEXAR_2023) / "images"
-        # image_dirs = list(image_dirs_path.glob("*"))
-        # 
-        # # Distribute directories evenly across CPUs
-        # chunked_dirs = self._chunk_list(image_dirs, self.ncpus)
-        # 
-        # futures = []
-        # with ProcessPoolExecutor(max_workers=self.ncpus) as executor:
-        #     # Submit one task per CPU, where each task processes a chunk of directories
-        #     for chunk in chunked_dirs:
-        #         futures.append(executor.submit(self._process_dir_chunk, chunk))
-        #     
-        #     # Wait for all futures to complete and collect results
-        #     for future in futures:
-        #         result = future.result()  # This will be a list of image paths
-        #         self.logger.info(f"Loaded {len(result)} images from task")
-        #         self.imgs.extend(result)
-        # 
-        # self.logger.success(f"Loaded {len(self.imgs)} images from Nexar 2023 dataset")
+        # Get all date folders (e.g., 2023-08-22, 2023-08-23, etc.)
+        date_folders = [d for d in dataset_root.iterdir() if d.is_dir() and d.name.startswith('2023-')]
+        date_folders.sort()  # Sort chronologically
+        
+        if not date_folders:
+            self.logger.error(f"No date folders found in {dataset_root}")
+            return []
+        
+        self.logger.info(f"Found {len(date_folders)} date folders")
+        
+        # Collect all image directories (the 'frames' subdirectories containing images)
+        all_image_dirs = []
+        
+        for date_folder in date_folders:
+            # Get all H3 hexagon folders in this date
+            h3_folders = [d for d in date_folder.iterdir() if d.is_dir() and d.name.isdigit()]
+            
+            for h3_folder in h3_folders:
+                # Look for the 'frames' subdirectory within each H3 folder
+                frames_dir = h3_folder / "frames"
+                if frames_dir.exists() and frames_dir.is_dir():
+                    # Check if this folder contains images
+                    images = list(frames_dir.glob("*.jpg"))
+                    if images:
+                        all_image_dirs.append(frames_dir)
+                        self.logger.debug(f"Found image directory: {frames_dir} with {len(images)} images")
+        
+        self.logger.info(f"Found {len(all_image_dirs)} directories containing images")
+        
+        if not all_image_dirs:
+            self.logger.warning("No image directories found")
+            return []
+        
+        # Distribute directories evenly across CPUs
+        chunked_dirs = self._chunk_list(all_image_dirs, self.ncpus)
+        
+        futures = []
+        with ProcessPoolExecutor(max_workers=self.ncpus) as executor:
+            # Submit one task per CPU, where each task processes a chunk of directories
+            for chunk in chunked_dirs:
+                futures.append(executor.submit(self._process_dir_chunk, chunk))
+            
+            # Wait for all futures to complete and collect results
+            for future in futures:
+                result = future.result()  # This will be a list of image paths
+                self.logger.info(f"Loaded {len(result)} images from task")
+                self.imgs.extend(result)
+        
+        self.logger.success(f"Loaded {len(self.imgs)} images from Nexar 2023 dataset")
         
         # Align with metadata if it's already loaded
         if not self.md.empty:
@@ -174,40 +217,124 @@ class Nexar2023Dataset(BaseNexarDataset):
     def load_metadata(self, export=False, format="parquet"):
         """Load metadata from the Nexar 2023 dataset.
         
+        The metadata is stored in CSV files within each H3 hexagon folder:
+        /share/ju/nexar_data/2023/
+        ├── 2023-08-22/
+        │   ├── 604222321527357439/
+        │   │   ├── frames/          # Images
+        │   │   └── metadata.csv     # Metadata file
+        │   └── ...
+        └── ...
+        
         Args:
             export: If True, save the metadata DataFrame to a file in EXPORT_DIR
             format: Export format ('parquet' or 'csv')
         """
-        # TODO: Implement proper metadata loading for 2023 dataset
-        self.logger.warning("Nexar 2023 metadata loading not fully implemented yet")
+        # Navigate to the 2023 dataset root
+        dataset_root = Path(NEXAR_2023)
+        if not dataset_root.exists():
+            self.logger.error(f"Dataset root not found: {dataset_root}")
+            return pd.DataFrame()
         
-        # Example implementation pattern (to be replaced with actual code)
-        # try:
-        #     # Try with parallel processing first
-        #     return self._load_metadata_parallel(export, format)
-        # except Exception as e:
-        #     self.logger.warning(f"Parallel processing failed: {str(e)}. Falling back to sequential processing.")
-        #     return self._load_metadata_sequential(export, format)
+        # Get all date folders
+        date_folders = [d for d in dataset_root.iterdir() if d.is_dir() and d.name.startswith('2023-')]
+        date_folders.sort()
+        
+        if not date_folders:
+            self.logger.error(f"No date folders found in {dataset_root}")
+            return pd.DataFrame()
+        
+        # Collect all metadata CSV files
+        all_metadata_files = []
+        
+        for date_folder in date_folders:
+            # Get all H3 hexagon folders in this date
+            h3_folders = [d for d in date_folder.iterdir() if d.is_dir() and d.name.isdigit()]
+            
+            for h3_folder in h3_folders:
+                # Look for metadata.csv directly in the H3 folder
+                metadata_file = h3_folder / "metadata.csv"
+                if metadata_file.exists():
+                    all_metadata_files.append(metadata_file)
+                    self.logger.debug(f"Found metadata file: {metadata_file}")
+        
+        self.logger.info(f"Found {len(all_metadata_files)} metadata files")
+        
+        if not all_metadata_files:
+            self.logger.warning("No metadata files found")
+            return pd.DataFrame()
+        
+        # Sort files by size for better load balancing
+        all_metadata_files.sort(key=lambda x: x.stat().st_size)
+        
+        # Distribute files evenly across CPUs
+        chunked_files = self._chunk_list(all_metadata_files, self.ncpus)
+        
+        futures = []
+        with ProcessPoolExecutor(max_workers=self.ncpus) as executor:
+            for chunk in chunked_files:
+                futures.append(executor.submit(self._process_md_chunk, chunk))
+            
+            dfs = [future.result() for future in futures]
+        
+        # Process the results
+        self._process_metadata_results(dfs, export, format)
         
         if export:
             self._export_metadata(format=format)
             
         return self.md
     
-    def _load_metadata_parallel(self, export=False, format="parquet"):
-        """Load metadata using parallel processing."""
-        # TODO: Implement parallel metadata loading for 2023 dataset
-        pass
-    
-    def _load_metadata_sequential(self, export=False, format="parquet"):
-        """Load metadata sequentially as a fallback."""
-        # TODO: Implement sequential metadata loading for 2023 dataset
-        pass
-    
     def _process_metadata_results(self, dfs, export=False, format="parquet"):
-        """Common processing for metadata results."""
-        # TODO: Implement metadata processing for 2023 dataset
-        pass
+        """Process metadata results from parallel loading.
+        
+        Args:
+            dfs: List of DataFrames from parallel processing
+            export: Whether to export the combined metadata
+            format: Export format
+        """
+        if dfs:
+            self.logger.info("Concatenating metadata DataFrames")
+            # Filter out empty DataFrames
+            non_empty_dfs = [df for df in dfs if not df.empty]
+            
+            if non_empty_dfs:
+                self.md = pd.concat(non_empty_dfs, ignore_index=True, copy=False)
+                
+                # Process the metadata based on the 2023 structure
+                # The 2023 metadata might have different column names than 2020
+                if 'image_ref' in self.md.columns:
+                    # Extract frame_id from image_ref (similar to 2020)
+                    self.md['frame_id'] = self.md['image_ref'].apply(lambda x: Path(str(x)).stem)
+                elif 'filename' in self.md.columns:
+                    # Alternative column name for 2023
+                    self.md['frame_id'] = self.md['filename'].apply(lambda x: Path(str(x)).stem)
+                else:
+                    # If no obvious image reference column, try to infer from other columns
+                    self.logger.warning("No image_ref or filename column found. Attempting to infer frame_id...")
+                    # This would need to be customized based on actual 2023 metadata structure
+                
+                # Convert timestamp if present
+                if 'timestamp' in self.md.columns:
+                    if not pd.api.types.is_datetime64_any_dtype(self.md['timestamp']):
+                        # Try to convert from epoch milliseconds
+                        try:
+                            self.md['timestamp'] = pd.to_datetime(self.md['timestamp'], unit='ms')
+                            self.md['timestamp'] = self.md['timestamp'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
+                        except:
+                            # If that fails, try regular datetime parsing
+                            self.md['timestamp'] = pd.to_datetime(self.md['timestamp'])
+                
+                self.logger.success(f"Processed {len(self.md)} metadata rows")
+                
+                if export:
+                    self._export_metadata(format=format)
+            else:
+                self.md = pd.DataFrame()
+                self.logger.warning("All metadata DataFrames were empty")
+        else:
+            self.logger.warning("No metadata files were loaded")
+            self.md = pd.DataFrame()
 
 
 # ===== Helper Functions =====

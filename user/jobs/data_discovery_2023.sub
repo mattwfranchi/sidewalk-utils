@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --job-name=data_discovery_2023
+#SBATCH --output=/share/ju/matt/conjectural-inspector/conjectural_inspector/user/logs/data_discovery_2023/%j.out
+#SBATCH --error=/share/ju/matt/conjectural-inspector/conjectural_inspector/user/logs/data_discovery_2023/%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=128gb
+#SBATCH --time=6:00:00
+#SBATCH --partition=pierson
+
+source /home/mwf62/.bashrc
+source activate /share/ju/matt/conda/moondream
+
+python -m conjectural_inspector.user.nexar_2023_optimized --start_date=2023-08-15 --end_date=2023-11-15 --ncpus=12 --imgs=True --md=True --export=True --export_geoparquet=True --align=True

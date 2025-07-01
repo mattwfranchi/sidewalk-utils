@@ -38,7 +38,7 @@ except ImportError:
     PANDARALLEL_AVAILABLE = False
 
 # Export directory
-EXPORT_DIR = "/share/ju/sidewalk_utils/data/raw_export"
+EXPORT_DIR = "/share/ju/deos2ac/data/raw_export"
 
 class BaseNexarDataset(ABC):
     """Base class for Nexar datasets."""
