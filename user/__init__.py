@@ -1,0 +1,1 @@
+INSTALL_DIR = "/share/ju/sidewalk_utils"

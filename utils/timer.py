@@ -1,5 +1,5 @@
 """
-Timer decorator module for deos2ac project.
+Timer decorator module for sidewalk_utils project.
 Provides function execution time tracking using the project's logger.
 """
 

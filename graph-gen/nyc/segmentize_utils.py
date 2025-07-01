@@ -225,37 +225,45 @@ def compute_adjacency(gdf: gpd.GeoDataFrame, tolerance: float = 0.1,
         log_message(logger, "info", "Building spatial index")
         sindex = gdf.sindex
         
-        # Use the nearest method with max_distance to find adjacent geometries
-        log_message(logger, "info", f"Finding adjacent features with vectorized nearest operation (max_distance={tolerance})")
-        nearest_indices = sindex.nearest(
-            gdf.geometry, 
-            return_all=True,  # Get all equidistant neighbors
-            max_distance=tolerance  # Only find neighbors within our tolerance
-        )
+        # Use a more comprehensive approach to find adjacent geometries
+        log_message(logger, "info", f"Finding adjacent features with comprehensive spatial queries")
         
-        # Convert results to adjacency dictionary
-        log_message(logger, "info", "Processing adjacency results")
+        # Initialize adjacency dictionary
         adjacency_dict = {idx: [] for idx in gdf.index}
         
-        # Process the nearest indices
-        input_indices, tree_indices = nearest_indices
+        # Process each geometry to find its neighbors
+        total_features = len(gdf)
+        log_message(logger, "info", f"Processing {total_features} features for adjacency")
         
-        # Use numpy operations for speed
-        input_idx_values = gdf.index.values[input_indices]
-        tree_idx_values = gdf.index.values[tree_indices]
-        
-        # Track progress
-        total_pairs = len(input_indices)
-        log_message(logger, "info", f"Processing {total_pairs} potential adjacency pairs")
-        
-        # Process all pairs at once
-        for i in range(len(input_indices)):
-            source_idx = input_idx_values[i]
-            target_idx = tree_idx_values[i]
+        for idx, row in gdf.iterrows():
+            geom = row.geometry
             
-            # Don't add self-adjacency
-            if source_idx != target_idx:
-                adjacency_dict[source_idx].append(target_idx)
+            # Use intersection query with buffered geometry to find nearby features
+            buffered_geom = geom.buffer(tolerance)
+            candidate_indices = list(sindex.intersection(buffered_geom.bounds))
+            
+            # Check each candidate for actual adjacency
+            for candidate_idx in candidate_indices:
+                candidate_idx = gdf.index[candidate_idx]
+                
+                # Skip self
+                if candidate_idx == idx:
+                    continue
+                    
+                candidate_geom = gdf.loc[candidate_idx, 'geometry']
+                
+                # Check if geometries are actually within tolerance distance
+                if geom.distance(candidate_geom) <= tolerance:
+                    # Add bidirectional adjacency
+                    if candidate_idx not in adjacency_dict[idx]:
+                        adjacency_dict[idx].append(candidate_idx)
+                    if idx not in adjacency_dict[candidate_idx]:
+                        adjacency_dict[candidate_idx].append(idx)
+            
+            # Log progress every 10% of features
+            if (gdf.index.get_loc(idx) + 1) % max(1, total_features // 10) == 0:
+                progress = int(((gdf.index.get_loc(idx) + 1) / total_features) * 100)
+                log_message(logger, "info", f"Adjacency progress: {progress}%")
         
         # Add adjacency information to the dataframe
         log_message(logger, "info", "Adding adjacency information to dataframe")
@@ -284,10 +292,15 @@ def consolidate_corner_points(gdf: gpd.GeoDataFrame, min_distance: float = 10,
     """
     Consolidate points that are too close together at corners.
     
+    This function now preserves intersection connectivity by:
+    1. Identifying intersection points (points with high connectivity)
+    2. Merging nearby points while preserving their adjacency relationships
+    3. Ensuring intersection points maintain their network connectivity
+    
     Parameters:
     -----------
     gdf : GeoDataFrame
-        Segmentized points
+        Segmentized points with adjacency information
     min_distance : float
         Minimum distance between points (any closer will be consolidated)
     logger : Logger, optional
@@ -296,7 +309,7 @@ def consolidate_corner_points(gdf: gpd.GeoDataFrame, min_distance: float = 10,
     Returns:
     --------
     GeoDataFrame
-        Points with corner clusters consolidated
+        Points with corner clusters consolidated while preserving connectivity
     """
     log_message(logger, "info", f"Consolidating points closer than {min_distance} feet")
     
@@ -313,24 +326,41 @@ def consolidate_corner_points(gdf: gpd.GeoDataFrame, min_distance: float = 10,
     
     log_message(logger, "debug", f"Using geometry column: '{geometry_column}'")
     
+    # Check if we have adjacency information
+    has_adjacency = 'point_adjacent_ids' in gdf.columns
+    if has_adjacency:
+        log_message(logger, "info", "Found adjacency information - preserving connectivity during consolidation")
+    else:
+        log_message(logger, "warning", "No adjacency information found - connectivity may be lost")
+    
     # Create a copy to avoid modifying the original
     result = gdf.copy()
     
     # Build spatial index
     sindex = result.sindex
     
-    # Track points to remove
+    # Track points to remove and their replacements
     points_to_remove: Set = set()
-    consolidated_points: Dict[Any, Any] = {}
+    point_replacements: Dict[Any, Any] = {}  # Maps removed point to replacement point
     
-    # For each point
+    # First pass: identify intersection points (high connectivity points)
+    intersection_points = set()
+    if has_adjacency:
+        # Points with high connectivity are likely intersections
+        high_connectivity_threshold = 3  # Points with 3+ connections are likely intersections
+        for idx, row in result.iterrows():
+            if len(row['point_adjacent_ids']) >= high_connectivity_threshold:
+                intersection_points.add(idx)
+        
+        log_message(logger, "info", f"Identified {len(intersection_points)} potential intersection points")
+    
+    # Second pass: consolidate points while preserving intersection connectivity
     for idx, row in result.iterrows():
         # Skip if already marked for removal
         if idx in points_to_remove:
             continue
             
-        # Access geometry safely using the column name or index
-        # Use row[geometry_column] instead of row.geometry
+        # Access geometry safely using the column name
         point_geom = row[geometry_column]
         
         # Find nearby points
@@ -352,34 +382,81 @@ def consolidate_corner_points(gdf: gpd.GeoDataFrame, min_distance: float = 10,
         
         # If we found close points, consolidate them
         if close_points:
-            # Add to remove set
-            points_to_remove.update(close_points)
+            # Determine which point to keep (prefer intersection points)
+            points_to_consider = [idx] + close_points
+            best_point = idx
             
-            # Update adjacency information for this point
-            if 'point_adjacent_ids' in result.columns:
-                # Merge adjacency lists
-                for close_idx in close_points:
-                    if result.loc[close_idx, 'point_adjacent_ids']:
-                        for adj_id in result.loc[close_idx, 'point_adjacent_ids']:
-                            if adj_id not in result.loc[idx, 'point_adjacent_ids'] and adj_id != idx:
-                                result.loc[idx, 'point_adjacent_ids'].append(adj_id)
+            # Prefer intersection points as the consolidation target
+            for point in points_to_consider:
+                if point in intersection_points:
+                    best_point = point
+                    break
+            
+            # If no intersection point, prefer the one with highest connectivity
+            if best_point == idx and has_adjacency:
+                max_connectivity = len(result.loc[idx, 'point_adjacent_ids'])
+                for point in close_points:
+                    connectivity = len(result.loc[point, 'point_adjacent_ids'])
+                    if connectivity > max_connectivity:
+                        max_connectivity = connectivity
+                        best_point = point
+            
+            # Mark other points for removal
+            points_to_remove.update([p for p in points_to_consider if p != best_point])
+            
+            # Record replacements
+            for point in points_to_consider:
+                if point != best_point:
+                    point_replacements[point] = best_point
+            
+            # Merge adjacency information if available
+            if has_adjacency:
+                # Collect all unique adjacent points from all points being merged
+                all_adjacent = set()
+                for point in points_to_consider:
+                    all_adjacent.update(result.loc[point, 'point_adjacent_ids'])
+                
+                # Remove references to points being removed
+                all_adjacent = all_adjacent - set(points_to_remove)
+                
+                # Update the kept point's adjacency
+                result.loc[best_point, 'point_adjacent_ids'] = list(all_adjacent)
     
     # Remove consolidated points
     log_message(logger, "info", f"Removing {len(points_to_remove)} duplicate points")
     result = result.drop(list(points_to_remove))
     
+    # Update adjacency references to point to the correct consolidated points
+    if has_adjacency and point_replacements:
+        log_message(logger, "info", "Updating adjacency references to consolidated points")
+        for idx, row in result.iterrows():
+            updated_adjacent = []
+            for adj_point in row['point_adjacent_ids']:
+                # If this adjacent point was replaced, use the replacement
+                if adj_point in point_replacements:
+                    replacement = point_replacements[adj_point]
+                    # If the replacement is also being removed, find the final replacement
+                    while replacement in point_replacements:
+                        replacement = point_replacements[replacement]
+                    if replacement not in points_to_remove:
+                        updated_adjacent.append(replacement)
+                elif adj_point not in points_to_remove:
+                    updated_adjacent.append(adj_point)
+            
+            # Remove duplicates and self-references
+            updated_adjacent = list(set(updated_adjacent) - {idx})
+            result.loc[idx, 'point_adjacent_ids'] = updated_adjacent
+    
     # Update adjacency counts
-    if 'point_adjacent_ids' in result.columns:
+    if has_adjacency:
         result['point_adjacency_count'] = result['point_adjacent_ids'].apply(len)
         
-    # Fix adjacency references to removed points
-    if 'point_adjacent_ids' in result.columns:
-        log_message(logger, "info", "Fixing adjacency references to removed points")
-        for idx, row in result.iterrows():
-            # Filter out references to removed points
-            row['point_adjacent_ids'] = [adj for adj in row['point_adjacent_ids'] 
-                                         if adj not in points_to_remove]
-            result.loc[idx, 'point_adjacency_count'] = len(row['point_adjacent_ids'])
+        # Log connectivity statistics
+        avg_connectivity = result['point_adjacency_count'].mean()
+        max_connectivity = result['point_adjacency_count'].max()
+        isolated_count = (result['point_adjacency_count'] == 0).sum()
+        
+        log_message(logger, "info", f"After consolidation - avg connectivity: {avg_connectivity:.2f}, max: {max_connectivity}, isolated: {isolated_count}")
     
     log_message(logger, "info", f"Point consolidation complete: {len(gdf)} -> {len(result)} points")
     return result

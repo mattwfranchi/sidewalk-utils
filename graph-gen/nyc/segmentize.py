@@ -409,72 +409,6 @@ class SidewalkSegmentizer(GeoDataProcessor):
         self.logger.info(f"Segmentized into {len(ctx.segmentized_points)} points")
         return ctx
     
-    def merge_corner_points(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
-        """
-        Consolidate closely spaced points at corners and intersections
-        
-        Merges points that are too close together to avoid redundancy in the network
-        and create better topology at intersections.
-        """
-        if ctx.segmentized_points is None:
-            self.logger.error("No segmentized points available to merge corners")
-            return None
-            
-        # FIX: First ensure we have a proper GeoDataFrame before any geometry operations
-        if not isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
-            self.logger.warning("Converting result to GeoDataFrame before consolidation")
-            try:
-                # Check if it's a GeoSeries (common case after segmentization)
-                if isinstance(ctx.segmentized_points, gpd.GeoSeries):
-                    self.logger.info("Converting GeoSeries to GeoDataFrame")
-                    ctx.segmentized_points = gpd.GeoDataFrame(
-                        geometry=ctx.segmentized_points,
-                        crs=ctx.segmentized_points.crs
-                    )
-                else:
-                    # Try to find possible geometry column in a regular DataFrame
-                    points_df = ctx.segmentized_points
-                    geometry_col = None
-                    
-                    # Try to find a column with Point objects
-                    if 0 in points_df.columns and isinstance(points_df[0].iloc[0], Point):
-                        geometry_col = 0
-                    else:
-                        # Check other columns
-                        for col in points_df.columns:
-                            if isinstance(points_df[col].iloc[0], Point):
-                                geometry_col = col
-                                break
-                                
-                    if geometry_col is not None:
-                        self.logger.info(f"Using column '{geometry_col}' as geometry")
-                        ctx.segmentized_points = gpd.GeoDataFrame(
-                            points_df, 
-                            geometry=geometry_col,
-                            crs=PROJ_FT
-                        )
-                    else:
-                        self.logger.error("Could not find geometry column")
-                        return None
-            except Exception as e:
-                self.logger.error(f"Failed to convert to GeoDataFrame: {e}")
-                return None
-
-        # Now consolidate points to avoid duplication at corners
-        if ctx.segmentation_distance is not None:
-            consolidation_distance = ctx.segmentation_distance * 0.3
-            self.logger.info(f"Consolidating closely clustered points (threshold: {consolidation_distance}ft)")
-            ctx.segmentized_points = self.merge_nearby_corner_points(
-                ctx.segmentized_points, 
-                min_distance=consolidation_distance
-            )
-            
-            if ctx.segmentized_points is None:
-                self.logger.error("Failed to consolidate corner points")
-                return None
-                
-        return ctx
-    
     def filter_points_to_sidewalks(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
         """
         Filter points to ensure they fall within actual sidewalk areas
@@ -508,7 +442,20 @@ class SidewalkSegmentizer(GeoDataProcessor):
             
         # Log filtered data structure for debugging
         self.logger.info(f"Filtered result type: {type(ctx.segmentized_points)}")
-        self.logger.info(f"Filtered result columns: {ctx.segmentized_points.columns.tolist()}")
+        
+        # Check if we have a GeoSeries and convert it to GeoDataFrame
+        if isinstance(ctx.segmentized_points, gpd.GeoSeries):
+            self.logger.info("Converting GeoSeries to GeoDataFrame")
+            ctx.segmentized_points = gpd.GeoDataFrame(
+                geometry=ctx.segmentized_points,
+                crs=ctx.segmentized_points.crs
+            )
+        
+        # Now check if we have columns (should be a GeoDataFrame now)
+        if hasattr(ctx.segmentized_points, 'columns'):
+            self.logger.info(f"Filtered result columns: {ctx.segmentized_points.columns.tolist()}")
+        else:
+            self.logger.warning("Filtered result has no columns attribute")
         
         # Ensure geometry column is properly set after filtering
         if isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
@@ -680,6 +627,165 @@ class SidewalkSegmentizer(GeoDataProcessor):
                     
         return ctx
     
+    def merge_corner_points(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Consolidate closely spaced points at corners and intersections
+        
+        Merges points that are too close together to avoid redundancy in the network
+        and create better topology at intersections.
+        """
+        if ctx.segmentized_points is None:
+            self.logger.error("No segmentized points available to merge corners")
+            return None
+            
+        # FIX: First ensure we have a proper GeoDataFrame before any geometry operations
+        if not isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
+            self.logger.warning("Converting result to GeoDataFrame before consolidation")
+            try:
+                # Check if it's a GeoSeries (common case after segmentization)
+                if isinstance(ctx.segmentized_points, gpd.GeoSeries):
+                    self.logger.info("Converting GeoSeries to GeoDataFrame")
+                    ctx.segmentized_points = gpd.GeoDataFrame(
+                        geometry=ctx.segmentized_points,
+                        crs=ctx.segmentized_points.crs
+                    )
+                else:
+                    # Try to find possible geometry column in a regular DataFrame
+                    points_df = ctx.segmentized_points
+                    geometry_col = None
+                    
+                    # Try to find a column with Point objects
+                    if 0 in points_df.columns and isinstance(points_df[0].iloc[0], Point):
+                        geometry_col = 0
+                    else:
+                        # Check other columns
+                        for col in points_df.columns:
+                            if isinstance(points_df[col].iloc[0], Point):
+                                geometry_col = col
+                                break
+                                
+                    if geometry_col is not None:
+                        self.logger.info(f"Using column '{geometry_col}' as geometry")
+                        ctx.segmentized_points = gpd.GeoDataFrame(
+                            points_df, 
+                            geometry=geometry_col,
+                            crs=PROJ_FT
+                        )
+                    else:
+                        self.logger.error("Could not find geometry column")
+                        return None
+            except Exception as e:
+                self.logger.error(f"Failed to convert to GeoDataFrame: {e}")
+                return None
+
+        # Now consolidate points to avoid duplication at corners
+        if ctx.segmentation_distance is not None:
+            # Use a more conservative consolidation distance to preserve intersection connectivity
+            # The consolidation should be smaller than the point distance threshold to avoid breaking connections
+            if ctx.point_distance_threshold is not None:
+                consolidation_distance = min(ctx.segmentation_distance * 0.2, ctx.point_distance_threshold * 0.5)
+            else:
+                consolidation_distance = ctx.segmentation_distance * 0.2
+                
+            self.logger.info(f"Consolidating closely clustered points (threshold: {consolidation_distance:.2f}ft)")
+            self.logger.info(f"Using conservative consolidation to preserve intersection connectivity")
+            
+            ctx.segmentized_points = self.merge_nearby_corner_points(
+                ctx.segmentized_points, 
+                min_distance=consolidation_distance
+            )
+            
+            if ctx.segmentized_points is None:
+                self.logger.error("Failed to consolidate corner points")
+                return None
+                
+        return ctx
+    
+    def ensure_intersection_connectivity(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
+        """
+        Ensure intersection points maintain proper connectivity
+        
+        This method specifically handles intersection points to ensure they
+        remain connected to all relevant segments after consolidation.
+        """
+        if ctx.segmentized_points is None:
+            self.logger.error("No segmentized points available for intersection connectivity")
+            return None
+            
+        if not isinstance(ctx.segmentized_points, gpd.GeoDataFrame):
+            self.logger.error("Segmentized points is not a GeoDataFrame")
+            return None
+            
+        if 'point_adjacent_ids' not in ctx.segmentized_points.columns:
+            self.logger.warning("No adjacency information found, skipping intersection connectivity check")
+            return ctx
+            
+        self.logger.info("Ensuring intersection point connectivity")
+        
+        # Identify intersection points (high connectivity points)
+        adj_counts = ctx.segmentized_points['point_adjacent_ids'].apply(len)
+        intersection_threshold = 3  # Points with 3+ connections are likely intersections
+        intersection_points = adj_counts >= intersection_threshold
+        
+        intersection_count = intersection_points.sum()
+        self.logger.info(f"Found {intersection_count} intersection points")
+        
+        if intersection_count == 0:
+            self.logger.info("No intersection points found")
+            return ctx
+            
+        # Check for isolated intersection points
+        isolated_intersections = (adj_counts == 0) & intersection_points
+        isolated_count = isolated_intersections.sum()
+        
+        if isolated_count > 0:
+            self.logger.warning(f"Found {isolated_count} isolated intersection points")
+            
+            # Try to reconnect isolated intersection points
+            reconnected_count = 0
+            for idx in ctx.segmentized_points[isolated_intersections].index:
+                point_geom = ctx.segmentized_points.loc[idx, ctx.segmentized_points.geometry.name]
+                
+                # Find nearby points within a reasonable distance
+                search_distance = ctx.point_distance_threshold or (ctx.segmentation_distance * 1.5)
+                
+                # Use spatial index to find nearby points
+                sindex = ctx.segmentized_points.sindex
+                nearby_indices = list(sindex.query(point_geom.buffer(search_distance)))
+                
+                # Check each nearby point
+                for nearby_idx in nearby_indices:
+                    nearby_idx = ctx.segmentized_points.index[nearby_idx]
+                    if nearby_idx == idx:
+                        continue
+                        
+                    nearby_geom = ctx.segmentized_points.loc[nearby_idx, ctx.segmentized_points.geometry.name]
+                    distance = point_geom.distance(nearby_geom)
+                    
+                    if distance <= search_distance:
+                        # Add bidirectional adjacency
+                        if nearby_idx not in ctx.segmentized_points.loc[idx, 'point_adjacent_ids']:
+                            ctx.segmentized_points.loc[idx, 'point_adjacent_ids'].append(nearby_idx)
+                        if idx not in ctx.segmentized_points.loc[nearby_idx, 'point_adjacent_ids']:
+                            ctx.segmentized_points.loc[nearby_idx, 'point_adjacent_ids'].append(idx)
+                        reconnected_count += 1
+                        break  # Only connect to the first nearby point
+                        
+            if reconnected_count > 0:
+                self.logger.info(f"Reconnected {reconnected_count} isolated intersection points")
+                
+                # Update adjacency counts
+                ctx.segmentized_points['point_adjacency_count'] = ctx.segmentized_points['point_adjacent_ids'].apply(len)
+        
+        # Log final intersection statistics
+        final_adj_counts = ctx.segmentized_points['point_adjacent_ids'].apply(len)
+        final_intersection_points = final_adj_counts >= intersection_threshold
+        final_isolated = (final_adj_counts == 0) & final_intersection_points
+        
+        self.logger.info(f"Final intersection stats: {final_intersection_points.sum()} intersections, {final_isolated.sum()} still isolated")
+        
+        return ctx
+    
     def prepare_final_data(self, ctx: ProcessingContext) -> Optional[ProcessingContext]:
         """
         Prepare the final dataframe with attributes from original segments
@@ -802,9 +908,10 @@ class SidewalkSegmentizer(GeoDataProcessor):
             (self.simplify_sidewalk_geometries, "Simplifying geometries"),
             (self.calculate_segment_adjacency, "Calculating segment adjacency"),
             (self.segmentize_sidewalks, "Converting sidewalks to points"),
-            (self.merge_corner_points, "Merging corner points"),
             (self.filter_points_to_sidewalks, "Filtering points to sidewalk areas"),
             (self.establish_point_adjacency, "Establishing point adjacency network"),
+            (self.merge_corner_points, "Merging corner points"),
+            (self.ensure_intersection_connectivity, "Ensuring intersection connectivity"),
             (self.prepare_final_data, "Preparing final data structure"),
             (self.save_output_data, "Saving output data"),
             (self.report_statistics, "Reporting statistics")

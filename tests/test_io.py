@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 logger.setLevel("INFO")
 
 # Define project root for test resources
-project_root = Path("/share/ju/deos2ac")
+project_root = Path("/share/ju/sidewalk_utils")
 
 
 class TestNexar2020Dataset(unittest.TestCase):

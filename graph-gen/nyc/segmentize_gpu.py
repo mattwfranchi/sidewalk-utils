@@ -111,6 +111,14 @@ class SegmentizeGPUImplementations:
         segmentized_points = segmentized_points[master_mask]
         len_after = len(segmentized_points)
 
+        # Ensure we return a GeoDataFrame, not a GeoSeries
+        if isinstance(segmentized_points, gpd.GeoSeries):
+            self.logger.info("Converting filtered GeoSeries back to GeoDataFrame")
+            segmentized_points = gpd.GeoDataFrame(
+                geometry=segmentized_points,
+                crs=segmentized_points.crs
+            )
+
         self.logger.info(f"Segmentized points cleaned up, {len_before} -> {len_after}")
         return segmentized_points
         

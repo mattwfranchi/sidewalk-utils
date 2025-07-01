@@ -45,7 +45,7 @@ traffic['image_name'] = traffic['image_name'].str.replace('.jpg', '', regex=Fals
 logger.debug(f"Loaded traffic data with {len(traffic)} records")
 
 logger.info("Loading metadata from parquet files...")
-md = gpd.read_parquet("/share/ju/periscopes/data/raw_export/nexar2020_geo_6077397_20250329_000919.parquet")
+md = gpd.read_parquet("/share/ju/sidewalk_utils/data/raw_export/nexar2020_geo_6077397_20250329_000919.parquet")
 logger.debug(f"Loaded metadata with {len(md)} records")
 
 logger.info("Merging traffic data with metadata...")

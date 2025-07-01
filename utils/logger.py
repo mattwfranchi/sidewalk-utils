@@ -1,5 +1,5 @@
 """
-Custom logger for the deos2ac project.
+Custom logger for the sidewalk_utils project.
 Provides standardized logging with timestamp, log level, and source file information.
 """
 
@@ -49,7 +49,7 @@ class CustomFormatter(logging.Formatter):
         return formatter.format(record)
 
 class Logger(logging.Logger):
-    """Custom logger class for deos2ac project"""
+    """Custom logger class for sidewalk_utils project"""
     
     def __init__(self, name, level=logging.INFO):
         super().__init__(name, level)
@@ -83,7 +83,7 @@ def get_logger(name: Optional[str] = None) -> Logger:
         import inspect
         frame = inspect.stack()[1]
         module = inspect.getmodule(frame[0])
-        name = os.path.basename(module.__file__).split('.')[0] if module else "deos2ac"
+        name = os.path.basename(module.__file__).split('.')[0] if module else "sidewalk_utils"
     
     # Clear any existing logger to avoid duplicate handlers
     if name in logging.Logger.manager.loggerDict:

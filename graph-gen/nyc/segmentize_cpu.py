@@ -90,6 +90,14 @@ class SegmentizeCPUFallbacks:
         segmentized_points = segmentized_points[master_mask]
         len_after = len(segmentized_points)
         
+        # Ensure we return a GeoDataFrame, not a GeoSeries
+        if isinstance(segmentized_points, gpd.GeoSeries):
+            self.logger.info("Converting filtered GeoSeries back to GeoDataFrame")
+            segmentized_points = gpd.GeoDataFrame(
+                geometry=segmentized_points,
+                crs=segmentized_points.crs
+            )
+        
         self.logger.info(f"Segmentized points cleaned up, {len_before} -> {len_after}")
         return segmentized_points
     
@@ -165,9 +173,8 @@ class SegmentizeCPUFallbacks:
                     
                 for adj_segment_id in adjacent_segment_ids:
                     if adj_segment_id in segment_to_point_indices:
-                        # Only process each pair once (i,j) where i < j to avoid duplicates
-                        if segment_id < adj_segment_id:
-                            segment_pairs.append((segment_id, adj_segment_id))
+                        # Process both directions to ensure complete adjacency
+                        segment_pairs.append((segment_id, adj_segment_id))
             
             self.logger.info(f"Found {len(segment_pairs)} segment pairs to process")
             
@@ -237,6 +244,40 @@ class SegmentizeCPUFallbacks:
             for point1, point2 in all_results:
                 point_adjacency[point1].append(point2)
                 point_adjacency[point2].append(point1)  # Add bidirectional adjacency
+            
+            # Add within-segment adjacency relationships
+            self.logger.info("Adding within-segment adjacency relationships")
+            
+            # Group points by segment for within-segment adjacency
+            segment_groups = {}
+            for i, segment_id in enumerate(point_segment_ids):
+                if segment_id not in segment_groups:
+                    segment_groups[segment_id] = []
+                segment_groups[segment_id].append(i)
+            
+            # Process each segment for within-segment adjacency
+            for segment_id, point_indices in segment_groups.items():
+                if len(point_indices) < 2:
+                    continue
+                    
+                # Check all point pairs within this segment
+                for i in range(len(point_indices)):
+                    for j in range(i + 1, len(point_indices)):
+                        idx1 = point_indices[i]
+                        idx2 = point_indices[j]
+                        
+                        point_geom1 = point_geometries[idx1]
+                        point_geom2 = point_geometries[idx2]
+                        
+                        if point_geom1.distance(point_geom2) <= point_distance_threshold:
+                            point_idx1 = points_df.index[idx1]
+                            point_idx2 = points_df.index[idx2]
+                            
+                            # Add bidirectional adjacency
+                            if point_idx2 not in point_adjacency[point_idx1]:
+                                point_adjacency[point_idx1].append(point_idx2)
+                            if point_idx1 not in point_adjacency[point_idx2]:
+                                point_adjacency[point_idx2].append(point_idx1)
             
             # Add adjacency information to the points dataframe
             self.logger.info("Adding adjacency information to points dataframe")

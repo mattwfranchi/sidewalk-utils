@@ -22,5 +22,8 @@ wget -O cb-nyc-2020.geojson 'https://services5.arcgis.com/GfwWNkhOj9bNBqoJ/arcgi
 wget -O nyc-1ft-dem.zip 'https://sa-static-customer-assets-us-east-1-fedramp-prod.s3.amazonaws.com/data.cityofnewyork.us/NYC_DEM_1ft_Int.zip'
 unzip -d data nyc-1ft-dem.zip
 
+## NYC 2020 Neighborhood Tabulation Areas 
+wget -O nta-nyc-2020.geojson 'https://data.cityofnewyork.us/resource/9nt8-h7nd.geojson'
+
 # delete zip
 rm nyc-1ft-dem.zip
