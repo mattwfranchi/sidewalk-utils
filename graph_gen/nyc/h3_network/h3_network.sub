@@ -1,0 +1,62 @@
+#!/bin/bash
+#SBATCH --job-name=h3_network
+#SBATCH --output=log/h3_network_%j.out
+#SBATCH --error=log/h3_network_%j.err
+#SBATCH --mail-type=ALL
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64gb
+#SBATCH --time=24:00:00
+#SBATCH --partition=pierson
+
+# Create logs directory if it doesn't exist
+mkdir -p log
+
+# Optimize CUDA memory allocation for H3 processing
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+export CUDA_LAUNCH_BLOCKING=0
+export OMP_NUM_THREADS=8
+export PYTHONUNBUFFERED=1
+
+echo "Job started at $(date)"
+echo "Running on host: $(hostname)"
+echo "Current working directory: $(pwd)"
+echo "Python version: $(python --version)"
+
+# Activate virtual environment with RAPIDS
+echo "Activating conda environment..."
+source activate /share/ju/matt/conda/rapids-25.02
+
+# Set input and output paths
+INPUT_SEGMENTS="/share/ju/sidewalk_utils/data/nyc/processed/sidewalkwidths_nyc.parquet"
+INTERMEDIATE_DIR="./intermediate"
+
+# Create intermediate directory
+mkdir -p $INTERMEDIATE_DIR
+
+echo "Starting H3 network generation..."
+echo "Input: $INPUT_SEGMENTS"
+echo "Intermediate dir: $INTERMEDIATE_DIR"
+
+# Run H3 network generation with optimal settings
+# - Resolution 13 for ~36m² cells (good for sidewalk analysis)
+# - Save intermediate results for debugging
+# - Use GPU acceleration
+# - Enable graph analytics
+python h3_network_generator.py \
+    $INPUT_SEGMENTS \
+    --resolution 13 \
+    --save-intermediate \
+    --intermediate-dir $INTERMEDIATE_DIR \
+    --verbose
+
+echo "H3 network generation completed at $(date)"
+
+# Display output file info
+echo "Generated files:"
+ls -la h3_network_res13_*.parquet 2>/dev/null || echo "No H3 network files found"
+ls -la $INTERMEDIATE_DIR/ 2>/dev/null || echo "No intermediate files found"
+
+echo "Job finished at $(date)" 

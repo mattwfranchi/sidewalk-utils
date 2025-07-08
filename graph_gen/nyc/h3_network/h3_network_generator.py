@@ -276,12 +276,11 @@ class H3NetworkGenerator:
             }
             
             edge_length_m = h3_edge_lengths.get(h3_resolution, 3.559)
-            max_intersection_distance_m = 2.0 * edge_length_m
-            buffer_degrees = max_intersection_distance_m / 111320.0
+            circumradius_m = edge_length_m
+            buffer_degrees = (circumradius_m * 1.5) / 111320.0
             
-            self._log(f"H3 resolution {h3_resolution}: edge={edge_length_m:.3f}m")
-            self._log(f"Using conservative buffer of {max_intersection_distance_m:.3f}m ({buffer_degrees:.8f} degrees)")
-            self._log(f"This guarantees ALL intersecting hexagons are captured")
+            self._log(f"H3 resolution {h3_resolution}: edge={edge_length_m:.3f}m, circumradius={circumradius_m:.3f}m")
+            self._log(f"Using buffer of {circumradius_m * 1.5:.3f}m ({buffer_degrees:.8f} degrees)")
             
             intersecting_cells = set()
             total_segments = len(segments_wgs84)
@@ -338,16 +337,8 @@ class H3NetworkGenerator:
                     except:
                         pass
             
-            # Now filter out cells that don't actually intersect (post-processing verification)
-            self._log(f"GPU processing found {len(intersecting_cells)} candidate H3 cells using conservative buffer")
-            self._log("Performing geometric verification to remove false positives...")
-            
-            verified_cells = self._verify_h3_intersections(segments_wgs84, intersecting_cells, h3_resolution)
-            
-            self._log(f"After verification: {len(verified_cells)} cells actually intersect with segments")
-            self._log(f"Filtered out {len(intersecting_cells) - len(verified_cells)} false positives")
-            
-            return verified_cells
+            self._log(f"GPU buffered polygon processing found {len(intersecting_cells)} intersecting H3 cells")
+            return intersecting_cells
             
         except Exception as e:
             self._log(f"GPU buffered polygon processing failed, falling back to CPU: {e}")
@@ -373,19 +364,16 @@ class H3NetworkGenerator:
         
         edge_length_m = h3_edge_lengths.get(h3_resolution, 3.559)  # Default to res 13
         
-        # Calculate the MAXIMUM distance from a LineString to hexagon center for ANY intersecting hexagon
-        # This occurs when the LineString grazes the hexagon at a vertex
-        # Maximum distance = circumradius + half the diagonal across the hexagon
-        # For regular hexagon: circumradius = edge_length, diagonal = 2 * edge_length
-        # So max_distance = edge_length + edge_length = 2 * edge_length
-        max_intersection_distance_m = 2.0 * edge_length_m
+        # Calculate circumradius (distance from center to vertex) in meters
+        # For regular hexagon: circumradius = edge_length
+        circumradius_m = edge_length_m
         
         # Convert to degrees (approximate for mid-latitudes)
-        buffer_degrees = max_intersection_distance_m / 111320.0
+        # Use a safety factor of 1.5 to ensure we capture all intersecting cells
+        buffer_degrees = (circumradius_m * 1.5) / 111320.0
         
-        self._log(f"H3 resolution {h3_resolution}: edge={edge_length_m:.3f}m")
-        self._log(f"Using conservative buffer of {max_intersection_distance_m:.3f}m ({buffer_degrees:.8f} degrees)")
-        self._log(f"This guarantees ALL intersecting hexagons are captured")
+        self._log(f"H3 resolution {h3_resolution}: edge={edge_length_m:.3f}m, circumradius={circumradius_m:.3f}m")
+        self._log(f"Using buffer of {circumradius_m * 1.5:.3f}m ({buffer_degrees:.8f} degrees)")
         self._log(f"Processing {total_segments} segments with buffered polygon approach...")
         
         for idx, (_, row) in enumerate(segments_wgs84.iterrows()):
@@ -413,21 +401,13 @@ class H3NetworkGenerator:
                     continue
                 
                 intersecting_cells.update(segment_cells)
-            
-        except Exception as e:
+                    
+            except Exception as e:
                 self._log(f"Error processing segment {idx}: {e}")
                 continue
         
-        # Now filter out cells that don't actually intersect (post-processing verification)
-        self._log(f"Found {len(intersecting_cells)} candidate H3 cells using conservative buffer")
-        self._log("Performing geometric verification to remove false positives...")
-        
-        verified_cells = self._verify_h3_intersections(segments_wgs84, intersecting_cells, h3_resolution)
-        
-        self._log(f"After verification: {len(verified_cells)} cells actually intersect with segments")
-        self._log(f"Filtered out {len(intersecting_cells) - len(verified_cells)} false positives")
-        
-        return verified_cells
+        self._log(f"Found {len(intersecting_cells)} intersecting H3 cells using buffered polygon approach")
+        return intersecting_cells
     
     def _get_buffered_h3_cells_for_linestring(self, linestring, h3_resolution: int, buffer_degrees: float) -> Set[str]:
         """
@@ -492,77 +472,13 @@ class H3NetworkGenerator:
                         cell_id = h3.latlng_to_cell(coord[1], coord[0], h3_resolution)
                         if cell_id:
                             fallback_cells.add(cell_id)
-                except Exception as e:
-                    continue
-            
+                    except Exception as e:
+                        continue
+                
                 return fallback_cells
                 
             except Exception as e:
                 return set()
-    
-    def _verify_h3_intersections(self, segments_wgs84: gpd.GeoDataFrame, candidate_cells: Set[str], h3_resolution: int) -> Set[str]:
-        """
-        Verify that H3 cells actually intersect with segments using exact geometric intersection.
-        This removes false positives from the conservative buffering approach.
-        
-        Parameters:
-        -----------
-        segments_wgs84 : GeoDataFrame
-            Segments in WGS84 CRS
-        candidate_cells : Set[str]
-            Candidate H3 cell IDs from buffering
-        h3_resolution : int
-            H3 resolution
-            
-        Returns:
-        --------
-        Set[str]
-            Verified H3 cell IDs that actually intersect with segments
-        """
-        from shapely.geometry import Polygon
-        from shapely.strtree import STRtree
-        
-        # Create spatial index for segments
-        segment_geometries = list(segments_wgs84.geometry)
-        spatial_index = STRtree(segment_geometries)
-        
-        verified_cells = set()
-        total_candidates = len(candidate_cells)
-        
-        for i, cell_id in enumerate(candidate_cells):
-            # Progress logging every 1000 cells
-            if i % 1000 == 0:
-                self._log(f"Verifying cell {i+1}/{total_candidates} ({i/total_candidates*100:.1f}%)")
-            
-            try:
-                # Get H3 cell boundary as polygon in WGS84
-                cell_boundary = h3.cell_to_boundary(cell_id)
-                cell_boundary_geojson = [[coord[1], coord[0]] for coord in cell_boundary]
-                h3_polygon = Polygon(cell_boundary_geojson)
-                
-                if not h3_polygon.is_valid:
-                    continue
-                
-                # Use spatial index to find candidate segments
-                candidate_segments = spatial_index.query(h3_polygon)
-                
-                # Check if any segment actually intersects this hexagon
-                cell_intersects = False
-                for segment_idx in candidate_segments:
-                    if segment_idx < len(segments_wgs84):
-                        segment_geom = segments_wgs84.geometry.iloc[segment_idx]
-                        if h3_polygon.intersects(segment_geom):
-                            cell_intersects = True
-                            break
-                
-                if cell_intersects:
-                    verified_cells.add(cell_id)
-                            
-            except Exception as e:
-                # Skip cells that cause errors
-                continue
-        
-        return verified_cells
     
     def _create_h3_points_with_clipped_segments(self, segments_gdf: gpd.GeoDataFrame,
                                                intersecting_cells: Set[str],
