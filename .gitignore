@@ -186,3 +186,9 @@ conda/
 
 # any and all directories called 'keys'
 **/keys/
+
+# any and all directories called 'intermediate' 
+**/intermediate/ 
+
+# any and all parquet files 
+*.parquet

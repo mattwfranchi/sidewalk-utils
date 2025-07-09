@@ -1,0 +1,12 @@
+*.parquet 
+
+**/_debug_figs/
+**/detections/
+
+# any and all directories called 'keys'
+**/keys/
+
+# any and all directories called 'intermediate' 
+**/intermediate/ 
+
+data/ 
