@@ -192,3 +192,6 @@ conda/
 
 # any and all parquet files 
 *.parquet
+
+*.err
+*.out
