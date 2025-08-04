@@ -21,6 +21,7 @@ import cudf
 import cugraph
 import cuspatial
 import fire
+import random
 
 # Import centerline helper
 from centerline_helper import CenterlineHelper
@@ -183,9 +184,31 @@ class SampledPointNetwork:
         
         # Step 3: Initialize sampling parameters
         self.logger.info("Step 3: Initializing sampling parameters...")
-        sampling_params = self._initialize_sampling_parameters(
-            buffer_distance, sampling_interval, strategy, preserve_intersections
-        )
+        # Only uniform strategy is supported
+        if strategy != "uniform":
+            self.logger.warning(f"WARNING: Strategy '{strategy}' not supported. Using 'uniform'")
+            strategy = "uniform"
+        
+        # Ensure buffer distance is larger than sampling interval
+        if buffer_distance <= sampling_interval:
+            self.logger.warning(f"WARNING: Buffer distance ({buffer_distance}) should be larger than sampling interval ({sampling_interval})")
+            buffer_distance = sampling_interval * 2.0
+            self.logger.info(f"Adjusted buffer distance to {buffer_distance} feet")
+        
+        sampling_params = {
+            'buffer_distance': buffer_distance,
+            'sampling_interval': sampling_interval,
+            'strategy': strategy,
+            'preserve_intersections': preserve_intersections,
+            'buffer_distance_squared': buffer_distance ** 2,  # Pre-calculate for efficiency
+            'max_iterations': 1000  # Prevent infinite loops
+        }
+        
+        self.logger.info(f"Sampling parameters initialized:")
+        self.logger.info(f"  - Buffer distance: {buffer_distance} feet")
+        self.logger.info(f"  - Sampling interval: {sampling_interval} feet")
+        self.logger.info(f"  - Strategy: {strategy}")
+        self.logger.info(f"  - Preserve intersections: {preserve_intersections}")
         
         # Store adjacency parameters
         self._compute_adjacency = compute_adjacency
@@ -215,9 +238,9 @@ class SampledPointNetwork:
         # Step 6: Handle intersections (if enabled)
         if preserve_intersections:
             self.logger.info("Step 6: Processing intersection points...")
-            intersection_processed = self._process_intersection_points_direct(
-                filtered_points, validated_segments, sampling_params
-            )
+            # For uniform sampling, we don't need special intersection processing
+            self.logger.info("Uniform sampling - skipping intersection processing")
+            intersection_processed = filtered_points
         else:
             intersection_processed = filtered_points
         
@@ -230,12 +253,41 @@ class SampledPointNetwork:
         # Step 8: Compute adjacency relationships (optional)
         if compute_adjacency:
             self.logger.info("Step 8: Computing adjacency relationships...")
-            # Use filtered centerlines for adjacency computation if provided, otherwise use segments
-            adjacency_segments = adjacency_centerlines if adjacency_centerlines is not None else segments_gdf
-            self.logger.info(f"Using {'filtered centerlines' if adjacency_centerlines is not None else 'neighborhood segments'} for adjacency computation")
+            
+            # Debug pedestrian_ramps_points in main flow
+            self.logger.info(f"DEBUG: Main flow - pedestrian_ramps_points: {'exists' if pedestrian_ramps_points else 'None'}")
+            if pedestrian_ramps_points:
+                self.logger.info(f"DEBUG: Main flow - Have {len(pedestrian_ramps_points)} pedestrian ramps points")
+            
+            # Generate crosswalk centerlines between intersection points
+            if pedestrian_ramps_points:
+                self.logger.info("Step 8a: Generating crosswalk centerlines...")
+                crosswalk_centerlines = self._generate_intersection_centerlines(pedestrian_ramps_points, crosswalk_distance)
+                
+                # Debug crosswalk generation result
+                self.logger.info(f"DEBUG: Main flow - Generated {len(crosswalk_centerlines)} crosswalk centerlines")
+                
+                # Combine existing centerlines with crosswalk centerlines
+                if len(crosswalk_centerlines) > 0:
+                    if adjacency_centerlines is not None:
+                        # Combine filtered centerlines with crosswalk centerlines
+                        combined_centerlines = pd.concat([adjacency_centerlines, crosswalk_centerlines], ignore_index=True)
+                        self.logger.info(f"Combined {len(adjacency_centerlines)} existing centerlines with {len(crosswalk_centerlines)} crosswalk centerlines")
+                    else:
+                        # Use crosswalk centerlines only
+                        combined_centerlines = crosswalk_centerlines
+                        self.logger.info(f"Using {len(crosswalk_centerlines)} crosswalk centerlines for adjacency computation")
+                else:
+                    # No crosswalk centerlines generated, use existing centerlines
+                    combined_centerlines = adjacency_centerlines if adjacency_centerlines is not None else segments_gdf
+                    self.logger.info(f"No crosswalk centerlines generated, using {'filtered centerlines' if adjacency_centerlines is not None else 'neighborhood segments'}")
+            else:
+                # No intersection points, use existing centerlines
+                combined_centerlines = adjacency_centerlines if adjacency_centerlines is not None else segments_gdf
+                self.logger.info(f"No intersection points, using {'filtered centerlines' if adjacency_centerlines is not None else 'neighborhood segments'}")
             
             adjacency_enhanced = self.compute_adjacency_relationships(
-                topology_enhanced, adjacency_segments, 
+                topology_enhanced, combined_centerlines, 
                 walkshed_distance=walkshed_distance,
                 crosswalk_distance=crosswalk_distance
             )
@@ -245,6 +297,14 @@ class SampledPointNetwork:
         # Step 9: Create final GeoDataFrame
         self.logger.info("Step 9: Creating final sampled point network...")
         result = self._create_final_network(adjacency_enhanced, segments_gdf.crs)
+        
+        # Store the combined centerlines as an attribute of the result for inspection files
+        if compute_adjacency and 'combined_centerlines' in locals():
+            result.attrs['combined_centerlines_with_crosswalks'] = combined_centerlines
+            self.logger.info(f"DEBUG: Stored {len(combined_centerlines)} combined centerlines (including crosswalks) in result attributes")
+        else:
+            result.attrs['combined_centerlines_with_crosswalks'] = None
+            self.logger.info("DEBUG: No combined centerlines with crosswalks to store")
         
         # Log final statistics
         total_time = time.time() - start_time
@@ -460,57 +520,6 @@ class SampledPointNetwork:
             # Return empty GeoDataFrame with same columns
             return ramps_gdf.iloc[:0].copy()
 
-    def _initialize_sampling_parameters(self, buffer_distance: float, 
-                                       sampling_interval: float,
-                                       strategy: str,
-                                       preserve_intersections: bool) -> Dict:
-        """
-        Initialize sampling parameters and validate inputs.
-        
-        Parameters:
-        -----------
-        buffer_distance : float
-            Minimum distance between points
-        sampling_interval : float
-            Initial spacing between candidate points
-        strategy : str
-            Sampling strategy (only uniform is supported)
-        preserve_intersections : bool
-            Whether to preserve intersection points
-            
-        Returns:
-        --------
-        Dict
-            Sampling parameters dictionary
-        """
-        # Only uniform strategy is supported
-        if strategy != "uniform":
-            self.logger.warning(f"WARNING: Strategy '{strategy}' not supported. Using 'uniform'")
-            strategy = "uniform"
-        
-        # Ensure buffer distance is larger than sampling interval
-        if buffer_distance <= sampling_interval:
-            self.logger.warning(f"WARNING: Buffer distance ({buffer_distance}) should be larger than sampling interval ({sampling_interval})")
-            buffer_distance = sampling_interval * 2.0
-            self.logger.info(f"Adjusted buffer distance to {buffer_distance} feet")
-        
-        params = {
-            'buffer_distance': buffer_distance,
-            'sampling_interval': sampling_interval,
-            'strategy': strategy,
-            'preserve_intersections': preserve_intersections,
-            'buffer_distance_squared': buffer_distance ** 2,  # Pre-calculate for efficiency
-            'max_iterations': 1000  # Prevent infinite loops
-        }
-        
-        self.logger.info(f"Sampling parameters initialized:")
-        self.logger.info(f"  - Buffer distance: {buffer_distance} feet")
-        self.logger.info(f"  - Sampling interval: {sampling_interval} feet")
-        self.logger.info(f"  - Strategy: {strategy}")
-        self.logger.info(f"  - Preserve intersections: {preserve_intersections}")
-        
-        return params
-    
     def _generate_candidate_points(self, segments_gdf: gpd.GeoDataFrame,
                                   sampling_params: Dict,
                                   max_points_per_segment: int) -> List[Dict]:
@@ -531,7 +540,24 @@ class SampledPointNetwork:
         List[Dict]
             List of candidate point records
         """
-        return self._generate_uniform_candidates(segments_gdf, sampling_params, max_points_per_segment)
+        candidates = []
+        interval = sampling_params['sampling_interval']
+        
+        for idx, (_, row) in enumerate(segments_gdf.iterrows()):
+            if idx % 1000 == 0:
+                self.logger.info(f"  Processing segment {idx + 1}/{len(segments_gdf)} ({idx/len(segments_gdf)*100:.1f}%)")
+            
+            try:
+                segment_candidates = self._generate_points_along_linestring(
+                    row.geometry, interval, idx, row, max_points_per_segment
+                )
+                candidates.extend(segment_candidates)
+            except Exception as e:
+                self.logger.error(f"Error processing segment {idx}: {e}")
+                continue
+        
+        self.logger.info(f"Generated {len(candidates)} uniform candidate points")
+        return candidates
     
     def _generate_uniform_candidates(self, segments_gdf: gpd.GeoDataFrame,
                                     sampling_params: Dict,
@@ -606,10 +632,27 @@ class SampledPointNetwork:
         if length < interval:
             # For very short segments, place one point at the midpoint
             midpoint = linestring.interpolate(length / 2.0)
-            point_record = self._create_point_record(
-                midpoint, segment_idx, segment_row, length / 2.0, length, 0.5
-            )
-            points.append(point_record)
+            record = {
+                'geometry': midpoint,
+                'source_segment_idx': segment_idx,
+                'distance_along_segment': length / 2.0,
+                'segment_total_length': length,
+                'position_ratio': 0.5,
+                'point_id': None,  # Will be assigned later
+                'is_intersection': False,  # Will be updated if needed
+                'buffer_zone': None,  # Will be computed during filtering
+                'network_neighbors': [],  # Will be populated during topology computation
+            }
+            
+            # Add all original segment attributes with prefix
+            for col in segment_row.index:
+                if col != 'geometry':
+                    record[f'source_{col}'] = segment_row[col]
+            
+            # Ensure parent_id is directly accessible (not just as source_parent_id)
+            if 'parent_id' in segment_row.index:
+                record['parent_id'] = segment_row['parent_id']
+            points.append(record)
         else:
             # Generate points at regular intervals
             num_points = min(int(length / interval) + 1, max_points)
@@ -618,10 +661,27 @@ class SampledPointNetwork:
                 distance = min(i * interval, length)
                 point_geom = linestring.interpolate(distance)
                 
-                point_record = self._create_point_record(
-                    point_geom, segment_idx, segment_row, distance, length, distance / length
-                )
-                points.append(point_record)
+                record = {
+                    'geometry': point_geom,
+                    'source_segment_idx': segment_idx,
+                    'distance_along_segment': distance,
+                    'segment_total_length': length,
+                    'position_ratio': distance / length,
+                    'point_id': None,  # Will be assigned later
+                    'is_intersection': False,  # Will be updated if needed
+                    'buffer_zone': None,  # Will be computed during filtering
+                    'network_neighbors': [],  # Will be populated during topology computation
+                }
+                
+                # Add all original segment attributes with prefix
+                for col in segment_row.index:
+                    if col != 'geometry':
+                        record[f'source_{col}'] = segment_row[col]
+                
+                # Ensure parent_id is directly accessible (not just as source_parent_id)
+                if 'parent_id' in segment_row.index:
+                    record['parent_id'] = segment_row['parent_id']
+                points.append(record)
         
         return points
     
@@ -725,7 +785,7 @@ class SampledPointNetwork:
         
         # Process each parent_id group separately
         for parent_id, parent_candidates in candidates_by_parent_id.items():
-            self.logger.info(f"  Processing parent_id {parent_id} with {len(parent_candidates)} candidates")
+            self.logger.debug(f"  Processing parent_id {parent_id} with {len(parent_candidates)} candidates")
             
             # Get accepted points for this parent_id only
             parent_accepted_points = [
@@ -1055,13 +1115,20 @@ class SampledPointNetwork:
                                       crosswalk_distance: float = 100.0,
                                       batch_params: Optional[Dict] = None) -> List[Dict]:
         """
-        Compute adjacency relationships using streamlined graph traversal.
+        Compute adjacency relationships using simplified GPU-accelerated approach.
         
-        This method implements a simplified adjacency algorithm:
-        1. Add crosswalk segments between nearby intersection points
-        2. For each point, find its containing segment
-        3. Traverse forward/backward along the segment to find adjacent points
-        4. For intersection points, also traverse along connected segments
+        This method consolidates all adjacency computation into a single GPU pipeline:
+        1. Convert all data to GPU format once
+        2. Compute nearest linestrings for all points
+        3. Find adjacencies in a single vectorized operation
+        4. Return results directly
+        
+        IMPORTANT INDEXING DIFFERENCES:
+        - cuDF DataFrames: Use .iloc[] for integer indexing, .loc[] for label indexing
+        - cuDF .idxmin()/.idxmax(): Returns the index value, not position
+        - cuDF .values: Returns CuPy arrays, use .get() to extract scalars
+        - cuSpatial quadtree: key_to_point maps point_id to quadtree index, not DataFrame index
+        - CuPy arrays: Use standard numpy-style indexing
         
         Parameters:
         -----------
@@ -1082,189 +1149,13 @@ class SampledPointNetwork:
             Points with adjacency information added
         """
         self.logger.info("=" * 60)
-        self.logger.info("COMPUTING ADJACENCY RELATIONSHIPS (STREAMLINED)")
+        self.logger.info("COMPUTING ADJACENCY RELATIONSHIPS (SIMPLIFIED GPU)")
         self.logger.info("=" * 60)
         
         start_time = time.time()
         
-        # Initialize batch parameters
-        if batch_params is None:
-            batch_params = {
-                'super_batch_size': 100,    # Process 100 streets at once (increased for simpler logic)
-                'sub_batch_size': 2000,     # Process 2k points at once (increased for simpler logic)
-                'micro_batch_size': 200,    # Network analysis batch size
-                'max_adjacent_points': 50   # Maximum adjacent points per point
-            }
-        
-        self.logger.info(f"Batch parameters: {batch_params}")
-        self.logger.info(f"Crosswalk distance: {crosswalk_distance} feet")
-        self.logger.info("Note: Adjacent distances are measured along segment paths (not straight-line)")
-        
-        # Step 1: Create enhanced network with crosswalks
-        self.logger.info("Step 1: Creating enhanced network with crosswalks...")
-        enhanced_segments = self._create_enhanced_network_with_crosswalks(
-            points, segments_gdf, crosswalk_distance, batch_params
-        )
-        
-        # NEW: Save enhanced network if save_intermediate is enabled
-        if hasattr(self, '_save_intermediate') and self._save_intermediate and hasattr(self, '_intermediate_dir'):
-            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-            enhanced_path = os.path.join(self._intermediate_dir, f"03_enhanced_network_with_crosswalks_{timestamp}.parquet")
-            enhanced_segments.to_parquet(enhanced_path)
-            self.logger.info(f"Saved enhanced network with crosswalks to: {enhanced_path}")
-        
-        # Step 2: Convert to GPU format for efficient processing
-        self.logger.info("Step 2: Converting data to GPU format...")
-        points_df, segments_df = self._convert_to_gpu_format(points, enhanced_segments)
-        
-        # Step 3: Compute adjacency relationships using graph traversal
-        self.logger.info("Step 3: Computing adjacency relationships via graph traversal...")
-        adjacency_start_time = time.time()
-        
-        adjacency_results = self._compute_adjacency_via_graph_traversal(
-            points_df, segments_df, batch_params
-        )
-        
-        adjacency_time = time.time() - adjacency_start_time
-        self.logger.info(f"Adjacency computation completed in {adjacency_time:.2f} seconds")
-        
-        # Step 4: Update points with adjacency information
-        self.logger.info("Step 4: Updating points with adjacency information...")
-        updated_points = self._update_points_with_adjacency(points, adjacency_results)
-        
-        # Log final statistics
-        total_time = time.time() - start_time
-        self._log_adjacency_statistics(updated_points, total_time)
-        
-        return updated_points
-
-    def _create_enhanced_network_with_crosswalks(self, points: List[Dict],
-                                                segments_gdf: gpd.GeoDataFrame,
-                                                crosswalk_distance: float,
-                                                batch_params: Dict) -> gpd.GeoDataFrame:
-        """
-        Create enhanced network by adding crosswalk segments between nearby intersection points.
-        
-        Parameters:
-        -----------
-        points : List[Dict]
-            Point records
-        segments_gdf : GeoDataFrame
-            Original sidewalk segments
-        crosswalk_distance : float
-            Maximum distance for crosswalk creation
-        batch_params : Dict
-            Batching parameters
-            
-        Returns:
-        --------
-        GeoDataFrame
-            Enhanced segments including crosswalks
-        """
-        self.logger.info(f"Creating enhanced network with crosswalks...")
-        
-        # Identify intersection points
-        intersection_points = []
-        for point in points:
-            if point.get('is_intersection', False) or point.get('is_pedestrian_ramp', False):
-                intersection_points.append({
-                    'geometry': point['geometry'],
-                    'point_id': point['point_id'],
-                    'parent_id': point.get('parent_id'),
-                    'x': point['geometry'].x,
-                    'y': point['geometry'].y
-                })
-        
-        self.logger.info(f"Found {len(intersection_points)} intersection points")
-        
-        if len(intersection_points) < 2:
-            self.logger.info("Not enough intersection points for crosswalks")
-            return segments_gdf
-        
-        # Convert to CuPy arrays for efficient distance calculations
-        intersection_coords = cp.array([[pt['x'], pt['y']] for pt in intersection_points])
-        
-        # Compute pairwise distances between intersection points
-        self.logger.info("Computing pairwise distances between intersection points...")
-        
-        # Process in micro-batches to avoid memory issues
-        crosswalks = []
-        micro_batch_size = batch_params['micro_batch_size']
-        
-        for i in range(0, len(intersection_coords), micro_batch_size):
-            end_i = min(i + micro_batch_size, len(intersection_coords))
-            batch_coords = intersection_coords[i:end_i]
-            
-            # Calculate distances from batch to all intersection points
-            diffs = batch_coords[:, cp.newaxis, :] - intersection_coords[cp.newaxis, :, :]
-            distances = cp.sqrt(cp.sum(diffs * diffs, axis=2))
-            
-            # Find pairs within crosswalk distance (excluding self)
-            for j in range(len(batch_coords)):
-                point_idx = i + j
-                if point_idx >= len(intersection_points):
-                    break
-                
-                # Get distances for this point
-                point_distances = distances[j]
-                
-                # Find nearby intersection points
-                nearby_indices = cp.where((point_distances > 0) & (point_distances <= crosswalk_distance))[0]
-                
-                for nearby_idx in cp.asnumpy(nearby_indices):
-                    if nearby_idx > point_idx:  # Avoid duplicate pairs
-                        # Create crosswalk segment
-                        point1 = intersection_points[point_idx]
-                        point2 = intersection_points[nearby_idx]
-                        
-                        crosswalk_geom = LineString([point1['geometry'], point2['geometry']])
-                        
-                        crosswalks.append({
-                            'geometry': crosswalk_geom,
-                            'parent_id': f"crosswalk_{len(crosswalks):06d}",
-                            'segment_type': 'crosswalk',
-                            'is_crosswalk': True,
-                            'length': crosswalk_geom.length,
-                            'source_point_id': point1['point_id'],
-                            'target_point_id': point2['point_id'],
-                            'distance': float(point_distances[nearby_idx])
-                        })
-        
-        self.logger.info(f"Created {len(crosswalks)} crosswalk segments")
-        
-        # Create GeoDataFrame for crosswalks
-        if crosswalks:
-            crosswalks_gdf = gpd.GeoDataFrame(crosswalks, crs=segments_gdf.crs)
-            
-            # Combine with original segments
-            enhanced_segments = gpd.GeoDataFrame(
-                pd.concat([segments_gdf, crosswalks_gdf], ignore_index=True),
-                crs=segments_gdf.crs
-            )
-        else:
-            enhanced_segments = segments_gdf
-        
-        self.logger.info(f"Enhanced network: {len(enhanced_segments)} total segments")
-        return enhanced_segments
-
-    def _convert_to_gpu_format(self, points: List[Dict], 
-                              segments_gdf: gpd.GeoDataFrame) -> Tuple[cudf.DataFrame, cudf.DataFrame]:
-        """
-        Convert points and segments to GPU format for efficient processing.
-        
-        Parameters:
-        -----------
-        points : List[Dict]
-            Point records
-        segments_gdf : GeoDataFrame
-            Enhanced segments including crosswalks
-            
-        Returns:
-        --------
-        Tuple[cudf.DataFrame, cudf.DataFrame]
-            Points and segments in GPU format
-        """
-        # Convert points to CuDF
+        # Step 1: Convert all data to GPU format once
+        self.logger.info("Step 1: Converting data to GPU format...")
         points_data = []
         for point in points:
             points_data.append({
@@ -1278,34 +1169,26 @@ class SampledPointNetwork:
                 'is_pedestrian_ramp': bool(point.get('is_pedestrian_ramp', False))
             })
 
-        # unzip x and y from points_data 
+        # Create points GeoDataFrame and convert to cuSpatial
         x, y = zip(*[(point['x'], point['y']) for point in points_data])
         points_gdf = gpd.GeoDataFrame(points_data, geometry=gpd.points_from_xy(x, y))
-
-        points_gdf = cuspatial.from_geopandas(points_gdf)
+        points_df = cuspatial.from_geopandas(points_gdf)
         
-        # Convert segments to CuDF with explicit type handling
+        # Convert segments to CuDF with all necessary columns
         segments_data = []
         for idx, (_, row) in enumerate(segments_gdf.iterrows()):
             try:
-                # Extract start and end points of the segment
                 coords = list(row.geometry.coords)
                 if len(coords) >= 2:
                     start_point = coords[0]
                     end_point = coords[-1]
                     
-                    # Ensure all values have consistent types
-                    parent_id = str(row.get('parent_id', ''))
-                    segment_type = str(row.get('segment_type', 'sidewalk'))
-                    is_crosswalk = bool(row.get('is_crosswalk', False))
-                    length = float(row.geometry.length)
-                    
                     segments_data.append({
                         'segment_id': int(idx),
-                        'parent_id': parent_id,
-                        'segment_type': segment_type,
-                        'is_crosswalk': is_crosswalk,
-                        'length': length,
+                        'parent_id': str(row.get('parent_id', '')),
+                        'segment_type': str(row.get('segment_type', 'sidewalk')),
+                        'is_crosswalk': bool(row.get('is_crosswalk', False)),
+                        'length': float(row.geometry.length),
                         'start_x': float(start_point[0]),
                         'start_y': float(start_point[1]),
                         'end_x': float(end_point[0]),
@@ -1319,568 +1202,39 @@ class SampledPointNetwork:
             self.logger.error("No valid segments found for GPU conversion")
             raise ValueError("No valid segments could be converted to GPU format")
         
-        # make linestrings from start and end points
-        from shapely.geometry import LineString
+        # Create segments GeoDataFrame and convert to cuSpatial
         linestrings = segments_gdf.geometry
         segments_gdf = gpd.GeoDataFrame(segments_data, geometry=linestrings)
-        segments_gdf = cuspatial.from_geopandas(segments_gdf)
+        segments_df = cuspatial.from_geopandas(segments_gdf)
         
-        self.logger.info(f"Converted {len(points_gdf)} points and {len(segments_gdf)} segments to GPU format")
-        return points_gdf, segments_gdf
-
-    def _compute_adjacency_via_graph_traversal(self, points_df: cudf.DataFrame,
-                                              segments_df: cudf.DataFrame,
-                                              batch_params: Dict) -> List[Dict]:
-        """
-        Compute adjacency relationships using efficient graph traversal with cuSpatial quadtree.
-        """
-        self.logger.info("Computing adjacency via graph traversal with cuSpatial quadtree...")
+        self.logger.info(f"Converted {len(points_df)} points and {len(segments_df)} segments to GPU format")
         
-        # Pre-build spatial index for efficient queries
-        spatial_index = self._build_spatial_index(points_df, segments_df)
-    
-        points_df = points_df
-        segments_df = segments_df
-        
-        # Process in batches
-        super_batch_size = batch_params.get('super_batch_size', 100)
-        sub_batch_size = batch_params.get('sub_batch_size', 2000)
-        
-        all_results = []
-        
-        for super_batch_start in range(0, len(points_df), super_batch_size):
-            super_batch_end = min(super_batch_start + super_batch_size, len(points_df))
-            super_batch = points_df.iloc[super_batch_start:super_batch_end]
-            
-            self.logger.info(f"Processing super-batch {super_batch_start//super_batch_size + 1}/{(len(points_df) + super_batch_size - 1)//super_batch_size}")
-            
-            batch_results = []
-            
-            for sub_batch_start in range(0, len(super_batch), sub_batch_size):
-                sub_batch_end = min(sub_batch_start + sub_batch_size, len(super_batch))
-                sub_batch = super_batch.iloc[sub_batch_start:sub_batch_end]
-                
-                # Use vectorized processing instead of iterrows for GPU GeoDataFrames
-                batch_results.extend(self._process_sub_batch_vectorized(
-                    sub_batch, points_df, segments_df, spatial_index
-                ))
-            
-            all_results.extend(batch_results)
-        
-        self.logger.info(f"Completed adjacency computation for {len(all_results)} points")
-        return all_results
-
-    def _process_sub_batch_vectorized(self, sub_batch: cudf.DataFrame,
-                                     points_df: cudf.DataFrame,
-                                     segments_df: cudf.DataFrame,
-                                     spatial_index) -> List[Dict]:
-        """
-        Process a sub-batch of points using TRUE vectorized operations with CuPy/cuDF broadcasting.
-        
-        Parameters:
-        -----------
-        sub_batch : cudf.DataFrame
-            Sub-batch of points to process
-        points_df : cudf.DataFrame
-            All points in the dataset
-        segments_df : cudf.DataFrame
-            All segments in the dataset
-        spatial_index : Dict
-            Pre-built spatial index
-            
-        Returns:
-        --------
-        List[Dict]
-            Adjacency results for the sub-batch
-        """
-        if len(sub_batch) == 0:
-            return []
-        
-        # Check if we have enough points for vectorized processing
-        if len(sub_batch) == 1:
-            self.logger.warning("Single point in sub-batch - this may cause issues with vectorized processing")
-        
-        # Extract all coordinates for TRUE vectorized processing
-        sub_batch_coords = cp.column_stack([
-            sub_batch['x'].values,
-            sub_batch['y'].values
-        ])
-        
-        # Extract all point metadata at once
-        sub_batch_point_ids = sub_batch['point_id'].values
-        sub_batch_source_segments = sub_batch['source_segment_idx'].values
-        sub_batch_distances = sub_batch['distance_along_segment'].values
-        sub_batch_is_intersection = sub_batch['is_intersection'].values
-        # Handle case where is_pedestrian_ramp column might not exist
-        if 'is_pedestrian_ramp' in sub_batch.columns:
-            sub_batch_is_pedestrian_ramp = sub_batch['is_pedestrian_ramp'].values
-        else:
-            sub_batch_is_pedestrian_ramp = cp.zeros(len(sub_batch), dtype=bool)
-        
-        # Get all points coordinates for distance calculations
-        all_points_coords = cp.column_stack([
-            points_df['x'].values,
-            points_df['y'].values
-        ])
-        
-        # Get all segments coordinates for segment-based adjacency (if available)
-        if 'start_x' in segments_df.columns and 'start_y' in segments_df.columns:
-            all_segments_start = cp.column_stack([
-                segments_df['start_x'].values,
-                segments_df['start_y'].values
-            ])
-            all_segments_end = cp.column_stack([
-                segments_df['end_x'].values,
-                segments_df['end_y'].values
-            ])
-        else:
-            raise ValueError("Segments DataFrame does not contain start_x and start_y columns")
-        
-        # TRUE VECTORIZED PROCESSING: Process entire sub-batch at once
-        batch_results = self._find_adjacent_points_batch_vectorized(
-            sub_batch_coords, sub_batch_point_ids, sub_batch_source_segments, 
-            sub_batch_distances, sub_batch_is_intersection, sub_batch_is_pedestrian_ramp,
-            all_points_coords, points_df, segments_df, spatial_index
+        # Step 2: Compute adjacency relationships in single GPU operation
+        self.logger.info("Step 2: Computing adjacency relationships...")
+        adjacency_results = self._compute_adjacency_gpu_simplified(
+            points_df, segments_df, crosswalk_distance
         )
         
-        return batch_results
-
-    def _find_adjacent_points_batch_vectorized(self, sub_batch_coords: cp.ndarray,
-                                              sub_batch_point_ids: cp.ndarray,
-                                              sub_batch_source_segments: cp.ndarray,
-                                              sub_batch_distances: cp.ndarray,
-                                              sub_batch_is_intersection: cp.ndarray,
-                                              sub_batch_is_pedestrian_ramp: cp.ndarray,
-                                              all_points_coords: cp.ndarray,
-                                              points_df: cudf.DataFrame,
-                                              segments_df: cudf.DataFrame,
-                                              spatial_index) -> List[Dict]:
-        """
-        TRUE vectorized adjacency computation for entire batch of points.
-        
-        Parameters:
-        -----------
-        sub_batch_coords : cp.ndarray
-            Coordinates of all points in sub-batch (shape: (n_points, 2))
-        sub_batch_point_ids : cp.ndarray
-            Point IDs for all points in sub-batch
-        sub_batch_source_segments : cp.ndarray
-            Source segment indices for all points in sub-batch
-        sub_batch_distances : cp.ndarray
-            Distances along segments for all points in sub-batch
-        sub_batch_is_intersection : cp.ndarray
-            Intersection flags for all points in sub-batch
-        sub_batch_is_pedestrian_ramp : cp.ndarray
-            Pedestrian ramp flags for all points in sub-batch
-        all_points_coords : cp.ndarray
-            Coordinates of all points in dataset
-        points_df : cudf.DataFrame
-            All points DataFrame
-        segments_df : cudf.DataFrame
-            All segments DataFrame
-        spatial_index : Dict
-            Spatial index
-            
-        Returns:
-        --------
-        List[Dict]
-            Adjacency results for all points in batch
-        """
-        batch_results = []
-        
-        # Step 1: Find containing segments for all points in batch using vectorized operations
-        containing_segments = self._find_containing_segments_batch_vectorized(
-            sub_batch_coords, segments_df, spatial_index
-        )
-        
-        # Step 2: Find segment-based adjacencies for all points
-        segment_adjacencies = self._find_segment_adjacencies_batch_vectorized(
-            sub_batch_coords, sub_batch_point_ids, sub_batch_distances,
-            containing_segments, all_points_coords, points_df, spatial_index
-        )
-        
-        # Step 3: Find intersection-based adjacencies for intersection points
-        intersection_adjacencies = self._find_intersection_adjacencies_batch_vectorized(
-            sub_batch_coords, sub_batch_point_ids, sub_batch_is_intersection, 
-            sub_batch_is_pedestrian_ramp, all_points_coords, points_df, segments_df, spatial_index
-        )
-        
-        # Step 4: Combine results for each point
-        for i in range(len(sub_batch_coords)):
-            point_id = int(sub_batch_point_ids[i])
-            
-            # Combine segment and intersection adjacencies
-            all_adjacent_points = []
-            all_adjacent_distances = []
-            
-            # Add segment-based adjacencies
-            if i in segment_adjacencies:
-                seg_points, seg_distances = segment_adjacencies[i]
-                all_adjacent_points.extend(seg_points)
-                all_adjacent_distances.extend(seg_distances)
-            
-            # Add intersection-based adjacencies
-            if i in intersection_adjacencies:
-                int_points, int_distances = intersection_adjacencies[i]
-                all_adjacent_points.extend(int_points)
-                all_adjacent_distances.extend(int_distances)
-            
-            # Create result record
-            if all_adjacent_points:
-                batch_results.append({
-                    'point_id': point_id,
-                    'adjacent_points': ','.join(map(str, all_adjacent_points)),
-                    'adjacent_distances': ','.join(map(str, all_adjacent_distances)),
-                    'adjacency_count': len(all_adjacent_points)
-                })
-            else:
-                batch_results.append({
-                    'point_id': point_id,
-                    'adjacent_points': '',
-                    'adjacent_distances': '',
-                    'adjacency_count': 0
-                })
-        
-        return batch_results
-
-    def _find_containing_segments_batch_vectorized(self, sub_batch_coords: cp.ndarray,
-                                                  segments_df: cudf.DataFrame,
-                                                  spatial_index) -> List[Optional[cp.ndarray]]:
-        """
-        Find containing segments for all points in batch using vectorized operations.
-        """
-        if spatial_index is None:
-            return [None] * len(sub_batch_coords)
-        
-        try:
-            import cuspatial
-            
-            # Convert all points in batch to cuSpatial GeoSeries
-            point_gs = cuspatial.GeoSeries.from_points_xy(sub_batch_coords.flatten())
-            
-            # Use quadtree to find nearest linestrings for all points at once
-            # Pass the geometry as a GeoSeries (which is what the function expects)
-            nearest_results = cuspatial.quadtree_point_to_nearest_linestring(
-                spatial_index['linestring_quad_pairs'], 
-                spatial_index['quadtree'], 
-                spatial_index['key_to_point'],
-                point_gs, 
-                segments_df.geometry  # Pass the GeoSeries of geometries
-            )
-            
-            # Process results for each point
-            containing_segments = []
-            tolerance = 3.0  # 3 foot tolerance
-            
-            for i in range(len(sub_batch_coords)):
-                # Find results for this specific point
-                point_results = nearest_results[nearest_results['point_index'] == i]
-                
-                if len(point_results) > 0:
-                    min_distance = point_results['distance'].iloc[0]
-                    if min_distance < tolerance:
-                        nearest_idx = point_results['linestring_index'].iloc[0]
-                        containing_segments.append(segments_df.iloc[nearest_idx])
-                    else:
-                        containing_segments.append(None)
-                else:
-                    containing_segments.append(None)
-            
-            return containing_segments
-            
-        except Exception as e:
-            self.logger.info(f"Error in batch vectorized segment finding: {e}")
-            # Fallback: return None for all points
-            return [None] * len(sub_batch_coords)
-
-    def _find_segment_adjacencies_batch_vectorized(self, sub_batch_coords: cp.ndarray,
-                                                  sub_batch_point_ids: cp.ndarray,
-                                                  sub_batch_distances: cp.ndarray,
-                                                  containing_segments: List[Optional[cp.ndarray]],
-                                                  all_points_coords: cp.ndarray,
-                                                  points_df: cudf.DataFrame,
-                                                  spatial_index) -> Dict[int, Tuple[List[int], List[float]]]:
-        """
-        Find segment-based adjacencies for all points in batch using vectorized operations.
-        """
-        segment_adjacencies = {}
-        
-        # Group points by their containing segments for efficient processing
-        segment_groups = {}
-        for i, segment in enumerate(containing_segments):
-            if segment is not None:
-                segment_id = int(segment['segment_id']) if 'segment_id' in segment.index else 0
-                if segment_id not in segment_groups:
-                    segment_groups[segment_id] = []
-                segment_groups[segment_id].append(i)
-        
-        # Process each segment group
-        for segment_id, point_indices in segment_groups.items():
-            # Find all points on this segment
-            segment_points = points_df[points_df['source_segment_idx'] == segment_id].copy()
-            
-            if len(segment_points) > 1:
-                # Find adjacencies for all points in this segment group
-                for point_idx in point_indices:
-                    point_id = int(sub_batch_point_ids[point_idx])
-                    distance_along = float(sub_batch_distances[point_idx])
-                    
-                    # Find forward and backward adjacencies
-                    forward_result = self._find_next_point_along_segment_vectorized(
-                        point_id, distance_along, segment_points, 'forward'
-                    )
-                    backward_result = self._find_next_point_along_segment_vectorized(
-                        point_id, distance_along, segment_points, 'backward'
-                    )
-                    
-                    adjacent_points = []
-                    adjacent_distances = []
-                    
-                    if forward_result is not None:
-                        forward_point_id, forward_distance = forward_result
-                        adjacent_points.append(forward_point_id)
-                        adjacent_distances.append(forward_distance)
-                    
-                    if backward_result is not None:
-                        backward_point_id, backward_distance = backward_result
-                        adjacent_points.append(backward_point_id)
-                        adjacent_distances.append(backward_distance)
-                    
-                    if adjacent_points:
-                        segment_adjacencies[point_idx] = (adjacent_points, adjacent_distances)
-        
-        return segment_adjacencies
-
-    def _find_intersection_adjacencies_batch_vectorized(self, sub_batch_coords: cp.ndarray,
-                                                       sub_batch_point_ids: cp.ndarray,
-                                                       sub_batch_is_intersection: cp.ndarray,
-                                                       sub_batch_is_pedestrian_ramp: cp.ndarray,
-                                                       all_points_coords: cp.ndarray,
-                                                       points_df: cudf.DataFrame,
-                                                       segments_df: cudf.DataFrame,
-                                                       spatial_index) -> Dict[int, Tuple[List[int], List[float]]]:
-        """
-        Find intersection-based adjacencies for all intersection points in batch using vectorized operations.
-        """
-        intersection_adjacencies = {}
-        
-        # Find intersection points in this batch
-        intersection_indices = cp.where(sub_batch_is_intersection | sub_batch_is_pedestrian_ramp)[0]
-        
-        if len(intersection_indices) == 0:
-            return intersection_adjacencies
-        
-        try:
-            import cuspatial
-            
-            # Process intersection points in smaller batches to avoid memory issues
-            batch_size = 100
-            for batch_start in range(0, len(intersection_indices), batch_size):
-                batch_end = min(batch_start + batch_size, len(intersection_indices))
-                batch_indices = intersection_indices[batch_start:batch_end]
-                
-                # Get coordinates for this batch of intersection points
-                batch_coords = sub_batch_coords[batch_indices]
-                batch_point_ids = sub_batch_point_ids[batch_indices]
-                
-                # Convert to cuSpatial GeoSeries
-                batch_gs = cuspatial.GeoSeries.from_points_xy(batch_coords.flatten())
-                
-                # Find nearby segments for all intersection points in batch
-                nearby_results = cuspatial.quadtree_point_to_nearest_linestring(
-                    spatial_index['linestring_quad_pairs'], 
-                    spatial_index['quadtree'], 
-                    spatial_index['key_to_point'],
-                    batch_gs, 
-                    segments_df.geometry  # Pass the GeoSeries of geometries
-                )
-                
-                # Process results for each intersection point
-                tolerance = 5.0
-                for i, point_idx in enumerate(batch_indices):
-                    point_id = int(batch_point_ids[i])
-                    
-                    # Find results for this specific point
-                    point_results = nearby_results[nearby_results['point_index'] == i]
-                    nearby_segments = point_results[point_results['distance'] < tolerance]
-                    
-                    connected_points = []
-                    connected_distances = []
-                    
-                    # For each connected segment, find the closest point
-                    for segment_idx in nearby_segments['linestring_index'].values:
-                        segment = segments_df.iloc[segment_idx]
-                        
-                        # Find points on this segment
-                        segment_points = points_df[points_df['source_segment_idx'] == segment_idx].copy()
-                        
-                        if len(segment_points) > 0:
-                            # Find the point closest to this intersection using vectorized distance calculation
-                            segment_point_coords = cp.column_stack([
-                                segment_points['x'].values,
-                                segment_points['y'].values
-                            ])
-                            
-                            # Compute distances from intersection to all segment points
-                            point_coord = sub_batch_coords[point_idx:point_idx+1]
-                            distances = cp.sqrt(cp.sum((segment_point_coords - point_coord) ** 2, axis=1))
-                            
-                            # Find closest point
-                            closest_idx = cp.argmin(distances)
-                            closest_point_id = int(segment_points.iloc[closest_idx]['point_id'])
-                            closest_distance = float(distances[closest_idx])
-                            
-                            # Don't include the intersection point itself
-                            if closest_point_id != point_id:
-                                connected_points.append(closest_point_id)
-                                connected_distances.append(closest_distance)
-                    
-                    if connected_points:
-                        intersection_adjacencies[point_idx] = (connected_points, connected_distances)
-            
-            return intersection_adjacencies
-            
-        except Exception as e:
-            self.logger.info(f"Error in batch vectorized intersection finding: {e}")
-            return intersection_adjacencies
-
-
-
-    def _find_next_point_along_segment_vectorized(self, point_id: int,
-                                                 current_distance: float,
-                                                 segment_points: cudf.DataFrame,
-                                                 direction: str) -> Optional[Tuple[int, float]]:
-        """
-        Find the next point along a segment in the specified direction using vectorized operations.
-        """
-        # Remove the current point from consideration
-        other_points = segment_points[segment_points['point_id'] != point_id].copy()
-        
-        if len(other_points) == 0:
-            return None
-        
-        if direction == 'forward':
-            # Find points with higher distance_along_segment
-            candidates = other_points[other_points['distance_along_segment'] > current_distance]
-            if len(candidates) > 0:
-                # Return the closest one
-                closest_idx = (candidates['distance_along_segment'] - current_distance).idxmin()
-                closest_point_id = int(candidates.loc[closest_idx, 'point_id'])
-                closest_distance = float(candidates.loc[closest_idx, 'distance_along_segment'] - current_distance)
-                return (closest_point_id, closest_distance)
-        else:  # backward
-            # Find points with lower distance_along_segment
-            candidates = other_points[other_points['distance_along_segment'] < current_distance]
-            if len(candidates) > 0:
-                # Return the closest one
-                closest_idx = (current_distance - candidates['distance_along_segment']).idxmin()
-                closest_point_id = int(candidates.loc[closest_idx, 'point_id'])
-                closest_distance = float(current_distance - candidates.loc[closest_idx, 'distance_along_segment'])
-                return (closest_point_id, closest_distance)
-        
-        return None
-
-    def _build_spatial_index(self, points_df: cuspatial.GeoDataFrame, segments_df: cuspatial.GeoDataFrame):
-        """
-        Build spatial index using cuSpatial quadtree for efficient spatial queries.
-        """
-        try:
-            import cuspatial
-            
-            points_df_cpu = points_df.to_geopandas()
-            segments_df_cpu = segments_df.to_geopandas()
-            points_bounds = points_df_cpu.total_bounds
-            segments_bounds = segments_df_cpu.total_bounds
-            # get global min and max of points_bounds and segments_bounds
-            # each is a tuple of (minx, miny, maxx, maxy)
-            min_x = min(points_bounds[0], segments_bounds[0])
-            min_y = min(points_bounds[1], segments_bounds[1])
-            max_x = max(points_bounds[2], segments_bounds[2])
-            max_y = max(points_bounds[3], segments_bounds[3])
-
-            # Build quadtree from points
-            scale = max(max_x - min_x, max_y - min_y) / (1 << 8)
-            max_depth = 8
-            max_size = 10
-            
-            key_to_point, quadtree = cuspatial.quadtree_on_points(
-                points_df.geometry,
-                min_x, max_x, min_y, max_y,
-                scale, max_depth, max_size
-            )
-            
-
-
-            line_bboxes = cuspatial.linestring_bounding_boxes(segments_df.geometry, expansion_radius=1.0)
-
-
-
-            
-            # Join quadtree with segment bounding boxes
-            linestring_quad_pairs = cuspatial.join_quadtree_and_bounding_boxes(
-                quadtree, line_bboxes,
-                min_x, max_x, min_y, max_y,
-                scale, max_depth
-            )
-            
-            result = cuspatial.quadtree_point_to_nearest_linestring(
-                linestring_quad_pairs,
-                quadtree,
-                key_to_point,
-                points_df.geometry,
-                segments_df.geometry
-            )
-
-            print(result)
-            
-        except ImportError:
-            self.logger.warning("cuSpatial not available, using CPU spatial index")
-            return None
-
-
-
-
-
-    def _update_points_with_adjacency(self, points: List[Dict], 
-                                     adjacency_results: List[Dict]) -> List[Dict]:
-        """
-        Update points with adjacency information.
-        
-        Parameters:
-        -----------
-        points : List[Dict]
-            Original point records
-        adjacency_results : List[Dict]
-            Adjacency computation results
-            
-        Returns:
-        --------
-        List[Dict]
-            Updated points with adjacency information
-        """
-        # Create lookup dictionary for adjacency results
+        # Step 3: Update points with adjacency information
+        self.logger.info("Step 3: Updating points with adjacency information...")
         adjacency_lookup = {result['point_id']: result for result in adjacency_results}
         
-        # Log adjacency results summary
         self.logger.info(f"Updating {len(points)} points with {len(adjacency_results)} adjacency results")
-        self.logger.info(f"Unique point_ids in adjacency results: {len(adjacency_lookup)}")
-        
-        # Check for duplicate point_ids in adjacency results
-        point_id_counts = {}
-        for result in adjacency_results:
-            point_id = result['point_id']
-            point_id_counts[point_id] = point_id_counts.get(point_id, 0) + 1
-        
-        duplicate_point_ids = {pid: count for pid, count in point_id_counts.items() if count > 1}
-        if duplicate_point_ids:
-            self.logger.warning(f"Found {len(duplicate_point_ids)} duplicate point_ids in adjacency results:")
-            for pid, count in list(duplicate_point_ids.items())[:5]:  # Show first 5
-                self.logger.warning(f"  Point_id {pid}: {count} results")
         
         # Update points with adjacency information
         updated_points = []
         points_with_adjacency = 0
-        for point in points:
+        
+        # Progress logging for point updates
+        total_points = len(points)
+        log_interval = max(1, total_points // 10)  # Log every 10% progress
+        
+        for i, point in enumerate(points):
+            # Progress logging
+            if i % log_interval == 0:
+                progress_pct = (i / total_points) * 100
+                self.logger.info(f"  Updating points: {i}/{total_points} ({progress_pct:.1f}%)")
+            
             point_id = point['point_id']
             adjacency_info = adjacency_lookup.get(point_id, {
                 'adjacent_points': '',
@@ -1899,45 +1253,448 @@ class SampledPointNetwork:
             updated_points.append(point)
         
         self.logger.info(f"Updated {points_with_adjacency}/{len(points)} points with adjacencies")
+        
+        # Log final statistics
+        total_time = time.time() - start_time
+        
         return updated_points
 
-    def _log_adjacency_statistics(self, points: List[Dict], total_time: float):
+    def _compute_adjacency_gpu_simplified(self, points_df: cudf.DataFrame,
+                                         segments_df: cudf.DataFrame,
+                                         crosswalk_distance: float) -> List[Dict]:
         """
-        Log statistics about the adjacency computation.
+        Simplified GPU adjacency computation that does everything in one operation.
         
         Parameters:
         -----------
-        points : List[Dict]
-            Points with adjacency information
-        total_time : float
-            Total processing time
+        points_df : cudf.DataFrame
+            Points in GPU format
+        segments_df : cudf.DataFrame
+            Segments in GPU format
+        crosswalk_distance : float
+            Maximum distance for crosswalk creation
+            
+        Returns:
+        --------
+        List[Dict]
+            Adjacency results for all points
         """
-        if not points:
-            return
+        self.logger.info("Computing adjacency relationships using simplified GPU pipeline...")
         
-        # Compute statistics
-        adjacency_counts = [point.get('adjacency_count', 0) for point in points]
-        total_adjacencies = sum(adjacency_counts)
+        # Step 1: Compute nearest linestrings for all points using cuSpatial
+        self.logger.info("Computing nearest linestrings using cuSpatial quadtree...")
+        try:
+            self.logger.info("Converting data to CPU for cuSpatial operations...")
+            # Convert to CPU for cuSpatial operations
+            points_df_cpu = points_df.to_geopandas()
+            segments_df_cpu = segments_df.to_geopandas()
+            
+            # Get bounds
+            self.logger.info("Computing spatial bounds...")
+            points_bounds = points_df_cpu.total_bounds
+            segments_bounds = segments_df_cpu.total_bounds
+            min_x = min(points_bounds[0], segments_bounds[0])
+            min_y = min(points_bounds[1], segments_bounds[1])
+            max_x = max(points_bounds[2], segments_bounds[2])
+            max_y = max(points_bounds[3], segments_bounds[3])
+
+            # Build quadtree
+            self.logger.info("Building cuSpatial quadtree...")
+            scale = max(max_x - min_x, max_y - min_y) / (1 << 8)
+            max_depth = 8
+            max_size = 10
+            
+            key_to_point, quadtree = cuspatial.quadtree_on_points(
+                points_df.geometry,
+                min_x, max_x, min_y, max_y,
+                scale, max_depth, max_size
+            )
+
+            # Get segment bounding boxes
+            self.logger.info("Computing segment bounding boxes...")
+            line_bboxes = cuspatial.linestring_bounding_boxes(segments_df.geometry, expansion_radius=1.0)
+            
+            # Join quadtree with segment bounding boxes
+            self.logger.info("Joining quadtree with segment bounding boxes...")
+            linestring_quad_pairs = cuspatial.join_quadtree_and_bounding_boxes(
+                quadtree, line_bboxes,
+                min_x, max_x, min_y, max_y,
+                scale, max_depth
+            )
+            
+            # Compute nearest linestring for each point
+            self.logger.info("Computing nearest linestrings for all points...")
+            nearest_results = cuspatial.quadtree_point_to_nearest_linestring(
+                linestring_quad_pairs,
+                quadtree,
+                key_to_point,
+                points_df.geometry,
+                segments_df.geometry
+            )
+
+            self.logger.info(f"Computed nearest linestrings for {len(nearest_results)} point-segment pairs")
+            nearest_data = {
+                'nearest_results': nearest_results,
+                'key_to_point': key_to_point
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error computing nearest linestrings: {e}")
+            nearest_data = None
+        if nearest_data is None:
+            self.logger.error("Failed to compute nearest linestrings")
+            return []
         
-        self.logger.info("\n" + "=" * 60)
-        self.logger.info("ADJACENCY COMPUTATION COMPLETED")
-        self.logger.info("=" * 60)
+        nearest_results = nearest_data['nearest_results']
+        key_to_point = nearest_data['key_to_point']
+        self.logger.info(f"Found nearest linestrings for {len(nearest_results)} point-segment pairs")
         
-        self.logger.info(f"Processing time: {total_time:.2f} seconds")
-        self.logger.info(f"Total points: {len(points)}")
-        self.logger.info(f"Total adjacencies: {total_adjacencies}")
-        self.logger.info(f"Average adjacencies per point: {total_adjacencies/len(points):.2f}")
-        self.logger.info(f"Max adjacencies per point: {max(adjacency_counts)}")
-        self.logger.info(f"Min adjacencies per point: {min(adjacency_counts)}")
+        # Step 2: Compute all adjacencies in a single vectorized operation
+        self.logger.info("Computing adjacency relationships for all points...")
+        self.logger.info("Step 1: Pre-computing data structures...")
         
-        # Distribution of adjacency counts
-        unique_counts = set(adjacency_counts)
-        for count in sorted(unique_counts):
-            num_points = adjacency_counts.count(count)
-            self.logger.info(f"  - {num_points} points with {count} adjacencies")
+        # Create quadtree mapping for efficient lookups. key should be the point_id, value should be the quadtree index.
+        quadtree_mapping = key_to_point.to_dict()
+        # reverse the keys and values
+        quadtree_mapping = {v: k for k, v in quadtree_mapping.items()}
         
-        self.logger.info("=" * 60)
-    
+        # Group points by type
+        segment_points_mask = ~(points_df['is_intersection'].values | 
+                              (points_df['is_pedestrian_ramp'].values if 'is_pedestrian_ramp' in points_df.columns else cp.zeros(len(points_df), dtype=bool)))
+        intersection_points_mask = ~segment_points_mask
+        
+        segment_point_indices = cp.where(segment_points_mask)[0]
+        intersection_point_indices = cp.where(intersection_points_mask)[0]
+        
+        self.logger.info(f"Grouped points: {len(segment_point_indices)} segment points, {len(intersection_point_indices)} intersection points")
+        
+        # Debug: Check intersection point details
+        if len(intersection_point_indices) > 0:
+            self.logger.info("Debug: Sample intersection points:")
+
+            sample_intersection_indices = random.sample(intersection_point_indices.tolist(), min(3, len(intersection_point_indices)))
+            for idx in sample_intersection_indices:
+                point_id = int(points_df['point_id'].iloc[idx])
+                is_intersection = bool(points_df['is_intersection'].iloc[idx])
+                is_pedestrian_ramp = bool(points_df['is_pedestrian_ramp'].iloc[idx]) if 'is_pedestrian_ramp' in points_df.columns else False
+                x = float(points_df['x'].iloc[idx])
+                y = float(points_df['y'].iloc[idx])
+                self.logger.info(f"  Point {point_id}: is_intersection={is_intersection}, is_pedestrian_ramp={is_pedestrian_ramp}, coords=({x:.2f}, {y:.2f})")
+        else:
+            self.logger.warning("WARNING: No intersection points found! Check if points are being marked as intersections correctly.")
+        
+        # Step 2: Process segment adjacencies in batch
+        self.logger.info("Step 2: Computing segment adjacencies...")
+        segment_adjacencies = self._compute_segment_adjacencies_batch(
+            points_df, segment_point_indices
+        )
+        
+        # Step 3: Process intersection adjacencies in batch
+        self.logger.info("Step 3: Computing intersection adjacencies...")
+        intersection_adjacencies = self._compute_intersection_adjacencies_batch(
+            points_df, intersection_point_indices, crosswalk_distance
+        )
+        
+        # Step 4: Combine results
+        self.logger.info("Step 4: Combining adjacency results...")
+        
+        # Create adjacency results in the same order as the original points DataFrame
+        # This ensures the indices match correctly
+        adjacency_results = []
+        
+        # Initialize all results with empty adjacencies, maintaining DataFrame order
+        for i in range(len(points_df)):
+            point_id = int(points_df['point_id'].iloc[i])
+            adjacency_results.append({
+                'point_id': point_id,
+                'adjacent_points': '',
+                'adjacent_distances': '',
+                'adjacency_count': 0
+            })
+        
+        # Create a proper mapping from point_id to DataFrame index
+        # This ensures we're using the correct indices that match adjacency_results
+        point_id_to_df_idx = {}
+        for i in range(len(points_df)):
+            point_id = int(points_df['point_id'].iloc[i])
+            point_id_to_df_idx[point_id] = i
+        
+        # Update with segment adjacencies
+        for point_id, adjacencies in segment_adjacencies.items():
+            if point_id in point_id_to_df_idx:
+                idx = point_id_to_df_idx[point_id]
+                adjacency_results[idx]['adjacent_points'] = ','.join(map(str, adjacencies['points']))
+                adjacency_results[idx]['adjacent_distances'] = ','.join(map(str, adjacencies['distances']))
+                adjacency_results[idx]['adjacency_count'] = len(adjacencies['points'])
+        
+        # Update with intersection adjacencies
+        intersection_update_count = 0
+        for point_id, adjacencies in intersection_adjacencies.items():
+            if point_id in point_id_to_df_idx:
+                idx = point_id_to_df_idx[point_id]
+                existing_points = adjacency_results[idx]['adjacent_points']
+                existing_distances = adjacency_results[idx]['adjacent_distances']
+                
+                # Combine with existing adjacencies
+                new_points = ','.join(map(str, adjacencies['points']))
+                new_distances = ','.join(map(str, adjacencies['distances']))
+                
+                if existing_points:
+                    adjacency_results[idx]['adjacent_points'] = f"{existing_points},{new_points}"
+                    adjacency_results[idx]['adjacent_distances'] = f"{existing_distances},{new_distances}"
+                else:
+                    adjacency_results[idx]['adjacent_points'] = new_points
+                    adjacency_results[idx]['adjacent_distances'] = new_distances
+                
+                adjacency_results[idx]['adjacency_count'] += len(adjacencies['points'])
+                intersection_update_count += 1
+        
+        self.logger.info(f"Updated {intersection_update_count} points with intersection adjacencies")
+        
+        # Log summary statistics
+        points_with_adjacencies = sum(1 for result in adjacency_results if result['adjacency_count'] > 0)
+        total_adjacencies = sum(result['adjacency_count'] for result in adjacency_results)
+        
+        # Debug: Print first few adjacency results to verify correctness
+        self.logger.info("Debug: Random sample of 5 adjacency results:")
+        sample_indices = random.sample(range(len(adjacency_results)), min(5, len(adjacency_results)))
+        for idx in sample_indices:
+            result = adjacency_results[idx]
+            self.logger.info(f"  Point {result['point_id']}: {result['adjacency_count']} adjacencies - {result['adjacent_points']}")
+        
+        self.logger.info(f"Adjacency computation summary:")
+        self.logger.info(f"  - Total points processed: {len(points_df)}")
+        self.logger.info(f"  - Points with adjacencies: {points_with_adjacencies}")
+        self.logger.info(f"  - Total adjacencies found: {total_adjacencies}")
+        self.logger.info(f"  - Average adjacencies per point: {total_adjacencies/len(points_df):.2f}")
+        
+        self.logger.info(f"Completed adjacency computation for {len(adjacency_results)} points")
+        return adjacency_results
+
+    def _compute_segment_adjacencies_batch(self, points_df: cudf.DataFrame,
+                                         segment_point_indices: cp.ndarray) -> Dict:
+        """
+        Compute segment adjacencies for all segment points in batch.
+        """
+        segment_adjacencies = {}
+        
+        # Group points by segment for efficient processing
+        segment_groups = {}
+        for idx in segment_point_indices:
+            point_id = int(points_df['point_id'].iloc[idx])
+            segment_idx = int(points_df['source_segment_idx'].iloc[idx])
+            distance = float(points_df['distance_along_segment'].iloc[idx])
+            
+            if segment_idx not in segment_groups:
+                segment_groups[segment_idx] = []
+            segment_groups[segment_idx].append((point_id, distance, idx))
+        
+        self.logger.info(f"Processing {len(segment_groups)} segments for segment adjacencies")
+        
+        # Debug: Print random sample of segment groups
+        sample_segments = random.sample(list(segment_groups.items()), min(3, len(segment_groups)))
+        for segment_idx, points in sample_segments:
+            self.logger.info(f"  Segment {segment_idx}: {len(points)} points")
+            # Show random sample of points in this segment
+            sample_points = random.sample(points, min(3, len(points)))
+            for point_id, distance, _ in sample_points:
+                self.logger.info(f"    Point {point_id}: distance {distance:.2f}")
+        
+        # Process each segment
+        for segment_idx, points in segment_groups.items():
+            if len(points) <= 1:
+                continue
+                
+            # Sort points by distance along segment
+            points.sort(key=lambda x: x[1])
+            
+            # Find adjacencies for each point in this segment
+            for i, (point_id, distance, _) in enumerate(points):
+                adjacent_points = []
+                adjacent_distances = []
+                
+                # Forward adjacency
+                if i + 1 < len(points):
+                    next_point_id, next_distance, _ = points[i + 1]
+                    adjacent_points.append(next_point_id)
+                    adjacent_distances.append(next_distance - distance)
+                
+                # Backward adjacency
+                if i > 0:
+                    prev_point_id, prev_distance, _ = points[i - 1]
+                    adjacent_points.append(prev_point_id)
+                    adjacent_distances.append(distance - prev_distance)
+                
+                if adjacent_points:
+                    segment_adjacencies[point_id] = {
+                        'points': adjacent_points,
+                        'distances': adjacent_distances
+                    }
+                    
+                    # Debug: Print random sample of adjacencies
+                    if len(segment_adjacencies) <= 5:
+                        self.logger.info(f"  Segment adjacency for point {point_id}: {adjacent_points} (distances: {adjacent_distances})")
+        
+        # Debug: Print random sample of segment adjacencies
+        if segment_adjacencies:
+            sample_adjacencies = random.sample(list(segment_adjacencies.items()), min(3, len(segment_adjacencies)))
+            self.logger.info("Debug: Random sample of segment adjacencies:")
+            for point_id, adjacencies in sample_adjacencies:
+                self.logger.info(f"  Point {point_id}: {adjacencies['points']} (distances: {adjacencies['distances']})")
+        
+        return segment_adjacencies
+
+    def _compute_intersection_adjacencies_batch(self, points_df: cudf.DataFrame,
+                                             intersection_point_indices: cp.ndarray,
+                                             crosswalk_distance: float) -> Dict:
+        """
+        Compute intersection adjacencies using direct point-to-point distance calculation.
+        This avoids the complex segment-based lookup that was causing index mismatches.
+        """
+        intersection_adjacencies = {}
+        
+        self.logger.info(f"Processing {len(intersection_point_indices)} intersection points using direct distance calculation")
+        
+        # Extract coordinates for all points
+        all_point_coords = []
+        all_point_ids = []
+        all_is_intersection = []
+        
+        for idx in range(len(points_df)):
+            point_id = int(points_df['point_id'].iloc[idx])
+            x = float(points_df['x'].iloc[idx])
+            y = float(points_df['y'].iloc[idx])
+            is_intersection = bool(points_df['is_intersection'].iloc[idx])
+            
+            all_point_coords.append((x, y))
+            all_point_ids.append(point_id)
+            all_is_intersection.append(is_intersection)
+        
+        # Separate intersection and regular points
+        intersection_coords = []
+        intersection_ids = []
+        regular_coords = []
+        regular_ids = []
+        
+        for i, (coords, point_id, is_intersection) in enumerate(zip(all_point_coords, all_point_ids, all_is_intersection)):
+            if is_intersection:
+                intersection_coords.append(coords)
+                intersection_ids.append(point_id)
+            else:
+                regular_coords.append(coords)
+                regular_ids.append(point_id)
+        
+        self.logger.info(f"DEBUG: Found {len(intersection_coords)} intersection points and {len(regular_coords)} regular points")
+        
+        # Process each intersection point
+        processed_count = 0
+        found_adjacencies_count = 0
+        distance_stats = []
+        
+        for i, (intersection_coord, intersection_id) in enumerate(zip(intersection_coords, intersection_ids)):
+            ix, iy = intersection_coord
+            
+            if processed_count < 3:  # Debug first 3 intersection points
+                self.logger.info(f"  DEBUG: Processing intersection point {intersection_id} at ({ix:.2f}, {iy:.2f})")
+            
+            adjacent_points = []
+            adjacent_distances = []
+            
+            # Find closest regular points within crosswalk_distance
+            for regular_coord, regular_id in zip(regular_coords, regular_ids):
+                rx, ry = regular_coord
+                distance = ((rx - ix) ** 2 + (ry - iy) ** 2) ** 0.5
+                distance_stats.append(distance)
+                
+                if distance <= crosswalk_distance and distance > 0:  # Exclude self
+                    adjacent_points.append(regular_id)
+                    adjacent_distances.append(distance)
+            
+            # Also find closest intersection points within crosswalk_distance (intersection-to-intersection connections)
+            for other_intersection_coord, other_intersection_id in zip(intersection_coords, intersection_ids):
+                if other_intersection_id != intersection_id:  # Don't connect to self
+                    ox, oy = other_intersection_coord
+                    distance = ((ox - ix) ** 2 + (oy - iy) ** 2) ** 0.5
+                    distance_stats.append(distance)
+                    
+                    if distance <= crosswalk_distance and distance > 0:
+                        adjacent_points.append(other_intersection_id)
+                        adjacent_distances.append(distance)
+            
+            # Sort by distance and limit to reasonable number
+            if adjacent_points:
+                # Sort by distance
+                sorted_pairs = sorted(zip(adjacent_distances, adjacent_points))
+                sorted_distances, sorted_points = zip(*sorted_pairs)
+                
+                # Limit to top 5 closest points
+                max_adjacencies = 10
+                final_distances = list(sorted_distances[:max_adjacencies])
+                final_points = list(sorted_points[:max_adjacencies])
+                
+                intersection_adjacencies[intersection_id] = {
+                    'points': final_points,
+                    'distances': final_distances
+                }
+                found_adjacencies_count += 1
+                
+                if processed_count < 3:  # Debug first few
+                    # Count intersection vs regular adjacencies
+                    intersection_adj_count = sum(1 for pt_id in final_points if pt_id in intersection_ids)
+                    regular_adj_count = len(final_points) - intersection_adj_count
+                    
+                    self.logger.info(f"    DEBUG: Found {len(final_points)} adjacencies for point {intersection_id} ({intersection_adj_count} intersection, {regular_adj_count} regular)")
+                    for j, (pt_id, dist) in enumerate(zip(final_points, final_distances)):
+                        pt_type = "intersection" if pt_id in intersection_ids else "regular"
+                        self.logger.info(f"      {j+1}: Point {pt_id} ({pt_type}) at distance {dist:.2f} feet")
+            
+            processed_count += 1
+        
+        # Debug: Show distance statistics
+        if distance_stats:
+            import numpy as np
+            distance_stats = np.array(distance_stats)
+            self.logger.info(f"Distance statistics for intersection points:")
+            self.logger.info(f"  - Total distances checked: {len(distance_stats)}")
+            self.logger.info(f"  - Min distance: {distance_stats.min():.2f} feet")
+            self.logger.info(f"  - Max distance: {distance_stats.max():.2f} feet")
+            self.logger.info(f"  - Mean distance: {distance_stats.mean():.2f} feet")
+            self.logger.info(f"  - Median distance: {np.median(distance_stats):.2f} feet")
+            self.logger.info(f"  - Distances <= {crosswalk_distance} feet: {np.sum(distance_stats <= crosswalk_distance)} ({np.sum(distance_stats <= crosswalk_distance)/len(distance_stats)*100:.1f}%)")
+            self.logger.info(f"  - Distances <= 50 feet: {np.sum(distance_stats <= 50)} ({np.sum(distance_stats <= 50)/len(distance_stats)*100:.1f}%)")
+            self.logger.info(f"  - Distances <= 25 feet: {np.sum(distance_stats <= 25)} ({np.sum(distance_stats <= 25)/len(distance_stats)*100:.1f}%)")
+        
+        self.logger.info(f"Intersection processing complete: {found_adjacencies_count}/{len(intersection_coords)} intersection points found adjacencies")
+        
+        # Calculate adjacency type statistics
+        total_intersection_to_intersection = 0
+        total_intersection_to_regular = 0
+        
+        for intersection_id, adjacencies in intersection_adjacencies.items():
+            for adj_point_id in adjacencies['points']:
+                if adj_point_id in intersection_ids:
+                    total_intersection_to_intersection += 1
+                else:
+                    total_intersection_to_regular += 1
+        
+        self.logger.info(f"Adjacency type breakdown:")
+        self.logger.info(f"  - Intersection-to-intersection: {total_intersection_to_intersection}")
+        self.logger.info(f"  - Intersection-to-regular: {total_intersection_to_regular}")
+        self.logger.info(f"  - Total adjacencies: {total_intersection_to_intersection + total_intersection_to_regular}")
+        
+        # Debug: Show sample intersection adjacencies
+        if intersection_adjacencies:
+            sample_intersection_adjacencies = random.sample(list(intersection_adjacencies.items()), min(3, len(intersection_adjacencies)))
+            self.logger.info("Debug: Sample intersection adjacencies:")
+            for point_id, adjacencies in sample_intersection_adjacencies:
+                intersection_adj_count = sum(1 for pt_id in adjacencies['points'] if pt_id in intersection_ids)
+                regular_adj_count = len(adjacencies['points']) - intersection_adj_count
+                self.logger.info(f"  Point {point_id}: {len(adjacencies['points'])} total ({intersection_adj_count} intersection, {regular_adj_count} regular)")
+        else:
+            self.logger.warning("WARNING: No intersection adjacencies found!")
+        
+        return intersection_adjacencies
+
     def _classify_relationship_gpu(self, segment_idx1: int, is_intersection1: bool,
                                   segment_idx2: int, is_intersection2: bool) -> str:
         """
@@ -2040,7 +1797,25 @@ class SampledPointNetwork:
         result = gpd.GeoDataFrame(final_data, crs=crs)
         
         # Add summary statistics as attributes
-        result.attrs['sampling_summary'] = self._compute_sampling_summary(topology_points)
+        if not topology_points:
+            summary = {}
+        else:
+            neighbor_distances = []
+            for point in topology_points:
+                neighbors = point.get('network_neighbors', [])
+                if neighbors:
+                    neighbor_distances.append(neighbors[0]['distance'])
+            
+            summary = {
+                'total_points': len(topology_points),
+                'intersection_points': sum(1 for pt in topology_points if pt.get('is_intersection', False)),
+                'avg_neighbor_distance': np.mean(neighbor_distances) if neighbor_distances else None,
+                'min_neighbor_distance': np.min(neighbor_distances) if neighbor_distances else None,
+                'max_neighbor_distance': np.max(neighbor_distances) if neighbor_distances else None,
+                'unique_segments': len(set(pt['source_segment_idx'] for pt in topology_points)),
+                'avg_points_per_segment': len(topology_points) / len(set(pt['source_segment_idx'] for pt in topology_points)),
+            }
+        result.attrs['sampling_summary'] = summary
         
         self.logger.info(f"Created final network with {len(result)} points")
         self.logger.info(f"Final columns: {list(result.columns)}")
@@ -2226,9 +2001,38 @@ class SampledPointNetwork:
             self.logger.error("Failed to load citywide centerlines")
             return self._create_empty_result(PROJ_FT)
         
-        # Filter citywide centerlines to only include those relevant to neighborhood segments
-        self.logger.info("Step 1c: Filtering citywide centerlines to neighborhood area...")
-        filtered_centerlines = self._filter_centerlines_to_neighborhood(citywide_centerlines, segments_gdf, buffer_distance)
+        # Load intersection points (pedestrian ramps) for centerline filtering
+        intersection_points = None
+        pedestrian_ramps_points = None  # Store for later use in inspection files
+        if pedestrian_ramps_path:
+            self.logger.info("Step 1b.1: Loading intersection points for centerline filtering...")
+            ramps_gdf = gpd.read_file(pedestrian_ramps_path)
+            ramps_gdf = ramps_gdf.to_crs(PROJ_FT)
+            
+            # Filter ramps to neighborhood area
+            filtered_ramps = self._filter_pedestrian_ramps(ramps_gdf, segments_gdf, buffer_distance)
+            
+            # Convert to list of dicts for centerline filtering
+            intersection_points = []
+            for idx, row in filtered_ramps.iterrows():
+                intersection_points.append({
+                    'geometry': row.geometry,
+                    'point_id': f"ramp_{idx}",
+                    'is_intersection': True,
+                    'is_pedestrian_ramp': True
+                })
+            
+            # Store pedestrian ramps points for later use in inspection files
+            pedestrian_ramps_points = self._load_and_process_pedestrian_ramps(pedestrian_ramps_path, segments_gdf)
+            
+            self.logger.info(f"Loaded {len(intersection_points)} intersection points for centerline filtering")
+        
+        # Filter citywide centerlines to only include those relevant to neighborhood segments AND intersection points
+        self.logger.info("Step 1c: Filtering citywide centerlines to neighborhood area and intersection points...")
+        filtered_centerlines = self._filter_centerlines_to_neighborhood(
+            citywide_centerlines, segments_gdf, buffer_distance, 
+            intersection_points=intersection_points, crosswalk_distance=crosswalk_distance
+        )
         self.logger.info(f"Filtered citywide centerlines: {len(citywide_centerlines)} -> {len(filtered_centerlines)} segments")
         
         if save_intermediate and intermediate_dir:
@@ -2264,9 +2068,10 @@ class SampledPointNetwork:
         self.logger.info("Step 3: Using sampled network directly (adjacency computation removed)...")
         final_network = sampled_network
         
-        # Step 4: Save final result
+        # Step 4: Save final result and intermediate files for inspection
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        
         if output_path:
-            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
             base_path = output_path.rsplit('.', 1)[0] if '.' in output_path else output_path
             extension = output_path.rsplit('.', 1)[1] if '.' in output_path else 'parquet'
             dynamic_output_path = f"{base_path}_sampled_{timestamp}.{extension}"
@@ -2279,21 +2084,169 @@ class SampledPointNetwork:
             save_network.to_parquet(dynamic_output_path)
             self.logger.info(f"Saved final network to: {dynamic_output_path}")
         
+        # Save intermediate files for inspection if requested
+        if save_intermediate:
+            # Determine output directory
+            if intermediate_dir:
+                output_dir = intermediate_dir
+            elif output_path:
+                output_dir = os.path.dirname(output_path) if os.path.dirname(output_path) else '.'
+            else:
+                output_dir = '.'
+            
+            # Save sampled network with centerlines for inspection
+            self.logger.info(f"DEBUG: compute_adjacency={compute_adjacency}, pedestrian_ramps_points={'exists' if pedestrian_ramps_points else 'None'}, pedestrian_ramps_path={pedestrian_ramps_path}")
+            
+            # Check if we have combined centerlines from the main flow (including crosswalks)
+            main_flow_centerlines = final_network.attrs.get('combined_centerlines_with_crosswalks')
+            
+            if main_flow_centerlines is not None and len(main_flow_centerlines) > 0:
+                self.logger.info(f"DEBUG: Using combined centerlines from main flow ({len(main_flow_centerlines)} total centerlines including crosswalks)")
+                combined_centerlines = main_flow_centerlines
+                
+                # Extract crosswalk centerlines for separate inspection file
+                if 'is_crosswalk' in combined_centerlines.columns:
+                    crosswalk_centerlines = combined_centerlines[combined_centerlines['is_crosswalk'] == True].copy()
+                    self.logger.info(f"DEBUG: Extracted {len(crosswalk_centerlines)} crosswalk centerlines from main flow")
+                else:
+                    crosswalk_centerlines = gpd.GeoDataFrame(columns=['geometry'], crs=segments_gdf.crs)
+                    self.logger.info("DEBUG: No is_crosswalk column found, creating empty crosswalk centerlines")
+                
+            elif compute_adjacency and (pedestrian_ramps_points or pedestrian_ramps_path):
+                self.logger.info("DEBUG: Main flow centerlines not available, regenerating crosswalks for inspection...")
+                
+                # If we don't have pedestrian_ramps_points but have a path, load them now
+                if not pedestrian_ramps_points and pedestrian_ramps_path:
+                    self.logger.info(f"DEBUG: Loading pedestrian ramps points from path for inspection...")
+                    pedestrian_ramps_points = self._load_and_process_pedestrian_ramps(pedestrian_ramps_path, segments_gdf)
+                    self.logger.info(f"DEBUG: Loaded {len(pedestrian_ramps_points) if pedestrian_ramps_points else 0} pedestrian ramps points")
+                
+                # Debug pedestrian_ramps_points
+                if pedestrian_ramps_points:
+                    self.logger.info(f"DEBUG: Have {len(pedestrian_ramps_points)} pedestrian ramps points for crosswalk generation")
+                else:
+                    self.logger.warning(f"DEBUG: No pedestrian ramps points available for crosswalk generation")
+                
+                # Generate crosswalk centerlines for inspection
+                crosswalk_centerlines = self._generate_intersection_centerlines(pedestrian_ramps_points, crosswalk_distance)
+                
+                # Debug crosswalk centerlines result
+                self.logger.info(f"DEBUG: Generated {len(crosswalk_centerlines)} crosswalk centerlines")
+                if len(crosswalk_centerlines) > 0:
+                    self.logger.info(f"DEBUG: Sample crosswalk centerlines:")
+                    for i, (_, row) in enumerate(crosswalk_centerlines.head(3).iterrows()):
+                        self.logger.info(f"  {i+1}: {row['segment_id']} - {row['segment_length']:.2f} feet")
+                
+                # Combine original centerlines with crosswalk centerlines
+                if len(crosswalk_centerlines) > 0:
+                    self.logger.info(f"DEBUG: Combining {len(filtered_centerlines)} original centerlines with {len(crosswalk_centerlines)} crosswalk centerlines")
+                    combined_centerlines = pd.concat([filtered_centerlines, crosswalk_centerlines], ignore_index=True)
+                    self.logger.info(f"Combined {len(filtered_centerlines)} original centerlines with {len(crosswalk_centerlines)} crosswalk centerlines for inspection")
+                    self.logger.info(f"DEBUG: Combined centerlines total: {len(combined_centerlines)}")
+                else:
+                    combined_centerlines = filtered_centerlines
+                    self.logger.info(f"Using {len(filtered_centerlines)} original centerlines for inspection (no crosswalks generated)")
+                    
+            else:
+                self.logger.info("DEBUG: No adjacency computation or pedestrian ramps, using filtered centerlines only")
+                combined_centerlines = filtered_centerlines
+                crosswalk_centerlines = gpd.GeoDataFrame(columns=['geometry'], crs=segments_gdf.crs)
+            
+            # Save combined centerlines for inspection
+            centerlines_inspection_path = os.path.join(output_dir, f"03_combined_centerlines_{timestamp}.parquet")
+            combined_centerlines['segment_id'] = combined_centerlines['segment_id'].astype(str)
+            combined_centerlines.to_parquet(centerlines_inspection_path)
+            self.logger.info(f"Saved combined centerlines for inspection to: {centerlines_inspection_path}")
+            
+            # Save crosswalk centerlines separately for inspection
+            if len(crosswalk_centerlines) > 0:
+                crosswalk_inspection_path = os.path.join(output_dir, f"03_crosswalk_centerlines_{timestamp}.parquet")
+                crosswalk_centerlines.to_parquet(crosswalk_inspection_path)
+                self.logger.info(f"Saved crosswalk centerlines for inspection to: {crosswalk_inspection_path}")
+                
+                # Save centerlines network WITH intersection point-to-point connections
+                centerlines_with_intersections_path = os.path.join(output_dir, f"03_centerlines_with_intersections_{timestamp}.parquet")
+                combined_centerlines.to_parquet(centerlines_with_intersections_path)
+                self.logger.info(f"Saved centerlines network with intersection connections to: {centerlines_with_intersections_path}")
+                
+                # Calculate crosswalk count more carefully
+                if main_flow_centerlines is not None:
+                    original_count = len(main_flow_centerlines) - len(crosswalk_centerlines)
+                    self.logger.info(f"DEBUG: 03_centerlines_with_intersections file contains {len(combined_centerlines)} total centerlines ({original_count} original + {len(crosswalk_centerlines)} crosswalks)")
+                else:
+                    self.logger.info(f"DEBUG: 03_centerlines_with_intersections file contains {len(combined_centerlines)} total centerlines (includes {len(crosswalk_centerlines)} crosswalks)")
+            else:
+                self.logger.info("No crosswalk centerlines found - saving centerlines without crosswalks")
+                
+                # Save centerlines as the network with intersections (no connections to add)
+                centerlines_with_intersections_path = os.path.join(output_dir, f"03_centerlines_with_intersections_{timestamp}.parquet")
+                combined_centerlines.to_parquet(centerlines_with_intersections_path)
+                self.logger.info(f"Saved centerlines network (no intersection connections) to: {centerlines_with_intersections_path}")
+                self.logger.info(f"DEBUG: 03_centerlines_with_intersections file contains {len(combined_centerlines)} centerlines only")
+            
+            # Save sampled network with centerlines for inspection
+            network_with_centerlines_path = os.path.join(output_dir, f"03_network_with_centerlines_{timestamp}.parquet")
+            
+            # Create a combined GeoDataFrame with both points and centerlines
+            # Convert points to a format that can be combined with centerlines
+            points_for_inspection = final_network.copy()
+            points_for_inspection['feature_type'] = 'point'
+            points_for_inspection['feature_id'] = points_for_inspection['point_id'].astype(str)
+            
+            # Prepare centerlines for combination
+            centerlines_for_inspection = combined_centerlines.copy()
+            centerlines_for_inspection['feature_type'] = 'centerline'
+            centerlines_for_inspection['feature_id'] = centerlines_for_inspection['segment_id'].astype(str)
+            
+            # Combine points and centerlines
+            combined_inspection = pd.concat([points_for_inspection, centerlines_for_inspection], ignore_index=True)
+            combined_inspection['parent_id'] = combined_inspection['parent_id'].astype(str)
+            combined_inspection.to_parquet(network_with_centerlines_path)
+            self.logger.info(f"Saved network with centerlines for inspection to: {network_with_centerlines_path}")
+        else:
+            # Save just the original centerlines for inspection even if adjacency is disabled
+            centerlines_inspection_path = os.path.join(output_dir, f"03_original_centerlines_{timestamp}.parquet")
+            filtered_centerlines.to_parquet(centerlines_inspection_path)
+            self.logger.info(f"Saved original centerlines for inspection to: {centerlines_inspection_path}")
+            
+            # Save centerlines network with intersection connections (even if adjacency is disabled)
+            centerlines_with_intersections_path = os.path.join(output_dir, f"03_centerlines_with_intersections_{timestamp}.parquet")
+            filtered_centerlines.to_parquet(centerlines_with_intersections_path)
+            self.logger.info(f"Saved centerlines network (no intersection connections) to: {centerlines_with_intersections_path}")
+            
+            # Save sampled network with original centerlines for inspection
+            network_with_centerlines_path = os.path.join(output_dir, f"03_network_with_centerlines_{timestamp}.parquet")
+            
+            # Create a combined GeoDataFrame with both points and centerlines
+            points_for_inspection = final_network.copy()
+            points_for_inspection['feature_type'] = 'point'
+            points_for_inspection['feature_id'] = points_for_inspection['point_id'].astype(str)
+            
+            # Prepare centerlines for combination
+            centerlines_for_inspection = filtered_centerlines.copy()
+            centerlines_for_inspection['feature_type'] = 'centerline'
+            centerlines_for_inspection['feature_id'] = centerlines_for_inspection['segment_id'].astype(str)
+            
+            # Combine points and centerlines
+            combined_inspection = pd.concat([points_for_inspection, centerlines_for_inspection], ignore_index=True)
+            combined_inspection['parent_id'] = combined_inspection['parent_id'].astype(str)
+            combined_inspection.to_parquet(network_with_centerlines_path)
+            self.logger.info(f"Saved network with original centerlines for inspection to: {network_with_centerlines_path}")
+        
         # Final statistics
         total_time = time.time() - start_time
         self.logger.info(f"\nTotal processing time: {total_time:.2f} seconds")
         self.logger.info(f"Final network: {len(final_network)} points")
         
-        exit()
+        return final_network
 
 
     
     # Removed _load_segments method - no longer needed with block-level processing
 
-    def _filter_centerlines_to_neighborhood(self, centerlines_gdf: gpd.GeoDataFrame, neighborhood_segments: gpd.GeoDataFrame, buffer_distance: float = 100.0) -> gpd.GeoDataFrame:
+    def _filter_centerlines_to_neighborhood(self, centerlines_gdf: gpd.GeoDataFrame, neighborhood_segments: gpd.GeoDataFrame, buffer_distance: float = 100.0, intersection_points: Optional[List[Dict]] = None, crosswalk_distance: float = 100.0) -> gpd.GeoDataFrame:
         """
-        Filter citywide centerlines to only include those relevant to neighborhood segments.
-        Similar to how pedestrian ramps are filtered.
+        Filter citywide centerlines to only include those relevant to neighborhood segments AND intersection points.
         
         Parameters:
         -----------
@@ -2303,18 +2256,23 @@ class SampledPointNetwork:
             Neighborhood segments GeoDataFrame
         buffer_distance : float
             Maximum distance to consider a centerline relevant to neighborhood
+        intersection_points : Optional[List[Dict]]
+            List of intersection points (pedestrian ramps) to consider
+        crosswalk_distance : float
+            Maximum distance for intersection point connections
             
         Returns:
         --------
         GeoDataFrame
-            Filtered centerlines relevant to neighborhood
+            Filtered centerlines relevant to neighborhood and intersection points
         """
         # Create a spatial index for the neighborhood segments
         segment_tree = STRtree(list(neighborhood_segments.geometry))
         
         # Find centerlines that are within buffer_distance of any neighborhood segment
-        filtered_centerlines = []
+        filtered_centerlines = set()
         
+        # First, find centerlines near neighborhood segments
         for idx, centerline_geom in enumerate(centerlines_gdf.geometry):
             # Find neighborhood segments within buffer distance
             nearby_segments = segment_tree.query(centerline_geom.buffer(buffer_distance))
@@ -2329,11 +2287,33 @@ class SampledPointNetwork:
                 
                 # Keep centerline if it's within buffer_distance
                 if min_distance <= buffer_distance:
-                    filtered_centerlines.append(idx)
+                    filtered_centerlines.add(idx)
+        
+        # Then, find centerlines near intersection points (if provided)
+        if intersection_points:
+            self.logger.info(f"Adding centerlines near {len(intersection_points)} intersection points...")
+            
+            # Create spatial index for centerlines
+            centerline_tree = STRtree(list(centerlines_gdf.geometry))
+            
+            for point in intersection_points:
+                point_geom = point['geometry']
+                
+                # Find centerlines within crosswalk distance of this intersection point
+                nearby_centerlines = centerline_tree.query(point_geom.buffer(crosswalk_distance))
+                
+                for centerline_idx in nearby_centerlines:
+                    centerline_geom = centerlines_gdf.iloc[centerline_idx].geometry
+                    distance = point_geom.distance(centerline_geom)
+                    
+                    if distance <= crosswalk_distance:
+                        filtered_centerlines.add(centerline_idx)
+            
+            self.logger.info(f"Added {len(filtered_centerlines)} centerlines total (neighborhood + intersection connections)")
         
         # Return filtered GeoDataFrame
         if filtered_centerlines:
-            return centerlines_gdf.iloc[filtered_centerlines].reset_index(drop=True)
+            return centerlines_gdf.iloc[list(filtered_centerlines)].reset_index(drop=True)
         else:
             # Return empty GeoDataFrame with same columns
             return centerlines_gdf.iloc[:0].copy()
@@ -2382,9 +2362,131 @@ class SampledPointNetwork:
             self.logger.error(f"Error loading centerlines: {e}")
             return None
     
+    def _generate_intersection_centerlines(self, intersection_points: List[Dict], crosswalk_distance: float = 100.0) -> gpd.GeoDataFrame:
+        """
+        Generate crosswalk centerlines BETWEEN pairs of intersection points.
+        These represent zebra crossings at intersections.
+        
+        Parameters:
+        -----------
+        intersection_points : List[Dict]
+            List of intersection point records with geometry
+        crosswalk_distance : float
+            Maximum distance for crosswalk connections
+            
+        Returns:
+        --------
+        GeoDataFrame
+            New crosswalk centerline segments connecting intersection points
+        """
+        self.logger.info(f"Generating crosswalk centerlines between {len(intersection_points)} intersection points...")
+        
+        # Debug: Check if intersection_points is empty or None
+        if not intersection_points:
+            self.logger.warning("No intersection points provided - cannot generate crosswalk centerlines")
+            return gpd.GeoDataFrame(columns=['geometry', 'width', 'segment_id', 'segment_length', 'segment_type', 'parent_id', 'is_crosswalk'], crs=PROJ_FT)
+        
+        # Debug: Show sample intersection points
+        sample_points = intersection_points[:3] if len(intersection_points) >= 3 else intersection_points
+        self.logger.info("Debug: Sample intersection points:")
+        for i, point in enumerate(sample_points):
+            self.logger.info(f"  Point {i}: ID={point.get('point_id', 'unknown')}, geom=({point['geometry'].x:.2f}, {point['geometry'].y:.2f})")
+        
+        new_centerlines = []
+        processed_pairs = set()  # Track processed pairs to avoid duplicates
+        
+        # Create spatial index for intersection points
+        point_geoms = [point['geometry'] for point in intersection_points]
+        point_tree = STRtree(point_geoms)
+        
+        distances_checked = []  # Track distances for debugging
+        
+        # Find pairs of intersection points within crosswalk distance
+        for i, point1 in enumerate(intersection_points):
+            point1_geom = point1['geometry']
+            point1_id = point1['point_id']
+            
+            # Find nearby intersection points
+            nearby_points = point_tree.query(point1_geom.buffer(crosswalk_distance))
+            
+            for j in nearby_points:
+                if i != j:  # Don't connect to self
+                    point2 = intersection_points[j]
+                    point2_geom = point2['geometry']
+                    point2_id = point2['point_id']
+                    
+                    # Calculate distance between intersection points
+                    distance = point1_geom.distance(point2_geom)
+                    distances_checked.append(distance)
+                    
+                    if distance <= crosswalk_distance and distance > 0:  # Don't create zero-length lines
+                        # Create a unique pair identifier to avoid duplicates (use sorted IDs)
+                        pair_id = tuple(sorted([point1_id, point2_id]))
+                        
+                        if pair_id not in processed_pairs:
+                            processed_pairs.add(pair_id)
+                            
+                            # Create a crosswalk centerline between the two intersection points
+                            # Fix: Extract coordinates from Point geometries properly
+                            point1_coords = (point1_geom.x, point1_geom.y)
+                            point2_coords = (point2_geom.x, point2_geom.y)
+                            crosswalk_centerline = LineString([point1_coords, point2_coords])
+                            
+                            # Create centerline record with all required columns
+                            centerline_record = {
+                                'geometry': crosswalk_centerline,
+                                'width': 10.0,  # Default width for crosswalks
+                                'segment_id': f"crosswalk_{point1_id}_to_{point2_id}",
+                                'segment_length': crosswalk_centerline.length,
+                                'segment_type': 'LineString',
+                                'parent_id': f"crosswalk_{point1_id}_{point2_id}",
+                                'source_intersection_id': point1_id,
+                                'target_intersection_id': point2_id,
+                                'crosswalk_distance': distance,
+                                'is_crosswalk': True  # Add missing column
+                            }
+                            
+                            new_centerlines.append(centerline_record)
+                            
+                            # Debug: Log first few crosswalks created
+                            if len(new_centerlines) <= 5:
+                                self.logger.info(f"  Created crosswalk {len(new_centerlines)}: {point1_id} -> {point2_id} (distance: {distance:.2f} feet)")
+        
+        # Debug: Show distance statistics
+        if distances_checked:
+            import numpy as np
+            distances_array = np.array(distances_checked)
+            self.logger.info(f"Distance statistics:")
+            self.logger.info(f"  - Total distances checked: {len(distances_checked)}")
+            self.logger.info(f"  - Min distance: {distances_array.min():.2f} feet")
+            self.logger.info(f"  - Max distance: {distances_array.max():.2f} feet")
+            self.logger.info(f"  - Mean distance: {distances_array.mean():.2f} feet")
+            self.logger.info(f"  - Distances <= {crosswalk_distance} feet: {np.sum(distances_array <= crosswalk_distance)} ({np.sum(distances_array <= crosswalk_distance)/len(distances_array)*100:.1f}%)")
+        
+        if new_centerlines:
+            # Convert to GeoDataFrame
+            crosswalk_centerlines = gpd.GeoDataFrame(new_centerlines, crs=PROJ_FT)
+            self.logger.info(f"Generated {len(crosswalk_centerlines)} crosswalk centerlines")
+            self.logger.info(f"  - Average length: {crosswalk_centerlines['segment_length'].mean():.2f} feet")
+            self.logger.info(f"  - Total length: {crosswalk_centerlines['segment_length'].sum():.2f} feet")
+            
+            # Debug: Show first few generated centerlines
+            self.logger.info("Debug: First few crosswalk centerlines:")
+            for i, (_, row) in enumerate(crosswalk_centerlines.head(3).iterrows()):
+                self.logger.info(f"  {i+1}: {row['segment_id']} - length {row['segment_length']:.2f} feet")
+            
+            return crosswalk_centerlines
+        else:
+            self.logger.warning("No crosswalk centerlines generated!")
+            self.logger.warning(f"  - Intersection points: {len(intersection_points)}")
+            self.logger.warning(f"  - Crosswalk distance threshold: {crosswalk_distance} feet")
+            if distances_checked:
+                self.logger.warning(f"  - Minimum distance between points: {min(distances_checked):.2f} feet")
+            return gpd.GeoDataFrame(columns=['geometry', 'width', 'segment_id', 'segment_length', 'segment_type', 'parent_id', 'is_crosswalk'], crs=PROJ_FT)
 
 
 
 if __name__ == "__main__":
     # Use Google Fire for CLI
     fire.Fire(SampledPointNetwork) 
+   
